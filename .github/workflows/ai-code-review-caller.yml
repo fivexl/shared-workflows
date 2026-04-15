@@ -1,0 +1,33 @@
+name: ai-code-review-caller
+
+# SECRETS: APP_ID, APP_PRIVATE_KEY, BEDROCK_ROLE_ARN
+
+# Caller workflow for the .github repo itself. Triggers on pull request
+# events and calls the shared ai-code-review workflow.
+# Other repos adopt via the workflow template in workflow-templates/.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ai-code-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write          # PR top-level comments use the issues API endpoint
+  id-token: write
+
+jobs:
+  review:
+    # Only run for non-draft PRs in the same repo.
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    # Same-repo relative path uses the reusable workflow at the caller commit (PR-safe).
+    # The workflow template for other repos continues to use @main.
+    uses: ./.github/workflows/ai-code-review.yml
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+      BEDROCK_ROLE_ARN: ${{ secrets.BEDROCK_ROLE_ARN }}
