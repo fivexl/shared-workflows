@@ -1,0 +1,458 @@
+name: ai-code-review
+
+# Shared reusable workflow for AI-powered PR code review.
+# Uses OpenCode (opencode CLI) with Amazon Bedrock. The orchestrator agent reads
+# the diff and decides which review dimensions are appropriate, spawning subagents
+# in parallel as needed.
+# AWS auth: OIDC → configure-aws-credentials (STS session keys on the runner).
+# Precomputed review inputs live under AI_REVIEW_DIR inside the repo worktree so
+# OpenCode can read them (paths under /tmp are treated as external_directory and
+# are auto-rejected in non-interactive runs).
+#
+# OpenCode CLI: install from anomalyco/opencode GitHub Release assets (not curl|bash).
+# Bump OPENCODE_RELEASE and OPENCODE_LINUX_X64_SHA256 together when upgrading.
+# Called by per-repo caller workflows via workflow_call.
+
+on:
+  workflow_call:
+    inputs:
+      review_plugin:
+        description: "Optional plugin name for language-specific or team-specific review rules"
+        required: false
+        type: string
+        default: ""
+      plugin_marketplace_repo:
+        description: "GitHub repo (org/name) hosting the plugin marketplace. Required when review_plugin is set."
+        required: false
+        type: string
+        default: ""
+      aws_region:
+        description: "AWS region for Bedrock"
+        required: false
+        type: string
+        default: "us-east-1"
+      model:
+        description: "Bedrock model ID (OpenCode amazon-bedrock provider)"
+        required: false
+        type: string
+        default: "zai.glm-5"
+      max_turns:
+        description: "Max agent turns"
+        required: false
+        type: string
+        default: "20"
+      show_full_output:
+        description: "Show verbose OpenCode logs in workflow logs"
+        required: false
+        type: string
+        default: "false"
+      approve_when_clean:
+        description: "If true, run gh pr review --approve when GraphQL shows no unresolved review threads involving this GitHub App bot"
+        required: false
+        type: string
+        default: "true"
+    secrets:
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+      BEDROCK_ROLE_ARN:
+        required: true
+
+jobs:
+  code-review:
+    name: opencode-code-review
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AI_REVIEW_DIR: .ai-review-work
+      # https://github.com/anomalyco/opencode/releases — linux x64 CLI tarball + SHA-256
+      OPENCODE_RELEASE: v1.3.15
+      OPENCODE_LINUX_X64_SHA256: ee9971caebdc1dab1a3f60349f2306875e97a7ddf713628cf89b82c28280e971
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write        # PR top-level comments use the issues API endpoint
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 https://github.com/actions/checkout
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1 https://github.com/actions/create-github-app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "FivexL AI Code Review"
+          git config user.email "ai-code-review@users.noreply.github.com"
+
+      - name: Configure git for private plugin marketplace
+        if: inputs.review_plugin != '' && inputs.plugin_marketplace_repo != ''
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com".insteadOf "https://github.com"
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0 https://github.com/aws-actions/configure-aws-credentials
+        with:
+          role-to-assume: ${{ secrets.BEDROCK_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Read AI review config
+        id: ai-config
+        env:
+          DEFAULT_MODEL: ${{ inputs.model }}
+          DEFAULT_MAX_TURNS: ${{ inputs.max_turns }}
+        run: |
+          CONFIG_FILE=".github/ai-review.yml"
+
+          if [ -f "$CONFIG_FILE" ]; then
+            MODEL=$(yq -r '.model // ""' "$CONFIG_FILE")
+            MAX_TURNS=$(yq -r '.max_turns // ""' "$CONFIG_FILE")
+          fi
+
+          echo "model=${MODEL:-$DEFAULT_MODEL}" >> "$GITHUB_OUTPUT"
+          echo "max_turns=${MAX_TURNS:-$DEFAULT_MAX_TURNS}" >> "$GITHUB_OUTPUT"
+
+      - name: Pre-compute PR diff
+        id: pr-diff
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p "${AI_REVIEW_DIR}"
+          git diff --name-only "${BASE_SHA}..${HEAD_SHA}" > "${AI_REVIEW_DIR}/changed-files.txt"
+          git diff "${BASE_SHA}..${HEAD_SHA}" > "${AI_REVIEW_DIR}/pr-diff.txt"
+          # Follows all pages; on very large PRs this file can grow large (same as local git diff size concerns).
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[] | {filename,patch}' > "${AI_REVIEW_DIR}/pr-patches.json"
+
+          echo "changed_files<<EOF" >> "$GITHUB_OUTPUT"
+          cat "${AI_REVIEW_DIR}/changed-files.txt" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Check for generated-only changes
+        id: generated-check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          ALL_GENERATED="true"
+
+          if [ ! -s "${AI_REVIEW_DIR}/changed-files.txt" ]; then
+            ALL_GENERATED="false"
+          fi
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              .github/workflows/*) ;;
+              *) ALL_GENERATED="false"; break ;;
+            esac
+            if [ -f "$file" ]; then
+              CONTENT=$(head -n 5 "$file")
+            else
+              CONTENT=$(git show "${BASE_SHA}:${file}" 2>/dev/null | head -n 5)
+            fi
+            if ! echo "$CONTENT" | grep -q "automatically generated from:"; then
+              ALL_GENERATED="false"
+              break
+            fi
+          done < "${AI_REVIEW_DIR}/changed-files.txt"
+
+          echo "skip_review=${ALL_GENERATED}" >> "$GITHUB_OUTPUT"
+          if [ "$ALL_GENERATED" = "true" ]; then
+            echo "::notice::All changed files are generated — skipping AI review."
+          fi
+
+      - name: Pre-compute existing bot comments
+        if: steps.generated-check.outputs.skip_review != 'true'
+        id: bot-comments
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eo pipefail
+
+          if [ -z "$APP_SLUG" ]; then
+            echo "::error::Failed to determine app slug from token step"
+            exit 1
+          fi
+
+          BOT_LOGIN="${APP_SLUG}[bot]"
+          echo "Bot login: ${BOT_LOGIN}"
+
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
+            | jq -s --arg bot "$BOT_LOGIN" '[.[][] | select(.user.login == $bot and .in_reply_to_id == null) | {id, path, line, original_line, body: (.body | tostring[0:200])}]' \
+            > "${AI_REVIEW_DIR}/bot-review-comments.json"
+
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
+            | jq -s --arg bot "$BOT_LOGIN" '[.[][] | select(.user.login == $bot and .in_reply_to_id != null) | {id, in_reply_to_id, body: (.body | tostring[0:200])}]' \
+            > "${AI_REVIEW_DIR}/bot-reply-comments.json"
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            | jq -s --arg bot "$BOT_LOGIN" '[.[][] | select(.user.login == $bot) | {id, body}]' \
+            > "${AI_REVIEW_DIR}/bot-issue-comments.json"
+
+          REVIEW_COUNT=$(jq 'length' "${AI_REVIEW_DIR}/bot-review-comments.json" || echo 0)
+          REPLY_COUNT=$(jq 'length' "${AI_REVIEW_DIR}/bot-reply-comments.json" || echo 0)
+          ISSUE_COUNT=$(jq 'length' "${AI_REVIEW_DIR}/bot-issue-comments.json" || echo 0)
+          echo "Found ${REVIEW_COUNT} bot review comments, ${REPLY_COUNT} bot reply comments, ${ISSUE_COUNT} bot issue comments"
+
+      - name: Print review configuration
+        if: steps.generated-check.outputs.skip_review != 'true'
+        env:
+          MODEL: ${{ steps.ai-config.outputs.model }}
+          MAX_TURNS: ${{ steps.ai-config.outputs.max_turns }}
+          CHANGED_FILES: ${{ steps.pr-diff.outputs.changed_files }}
+        run: |
+          echo "::group::Review configuration"
+          echo "Model: ${MODEL}"
+          echo "Max turns: ${MAX_TURNS}"
+          echo "::endgroup::"
+
+          echo "::group::Changed files"
+          echo "$CHANGED_FILES"
+          echo "::endgroup::"
+
+      - name: Install OpenCode
+        if: steps.generated-check.outputs.skip_review != 'true'
+        run: |
+          set -euo pipefail
+          TAR="${RUNNER_TEMP}/opencode-linux-x64.tar.gz"
+          URL="https://github.com/anomalyco/opencode/releases/download/${OPENCODE_RELEASE}/opencode-linux-x64.tar.gz"
+          curl -fSL "$URL" -o "$TAR"
+          echo "${OPENCODE_LINUX_X64_SHA256}  ${TAR}" | sha256sum -c -
+          echo "::notice::OpenCode ${OPENCODE_RELEASE} linux-x64 tarball SHA-256 verified"
+          mkdir -p "${HOME}/.opencode/bin"
+          tar -xzf "$TAR" -C "${HOME}/.opencode/bin"
+          chmod +x "${HOME}/.opencode/bin/opencode"
+          echo "${HOME}/.opencode/bin" >> "${GITHUB_PATH}"
+          export PATH="${HOME}/.opencode/bin:${PATH}"
+          test -x "${HOME}/.opencode/bin/opencode"
+
+      - name: OpenCode PR review
+        id: opencode-review
+        if: steps.generated-check.outputs.skip_review != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          MODEL: ${{ steps.ai-config.outputs.model }}
+          SHOW_FULL_OUTPUT: ${{ inputs.show_full_output }}
+        run: |
+          set -euo pipefail
+
+          jq -n \
+            --arg region "${AWS_REGION}" \
+            '{"$schema":"https://opencode.ai/config.json","provider":{"amazon-bedrock":{"options":{"region":$region}}}}' \
+            > opencode.json
+
+          EXTRA_LOG=()
+          if [ "${SHOW_FULL_OUTPUT}" = "true" ]; then
+            EXTRA_LOG=(--print-logs --log-level DEBUG)
+          fi
+
+          cat <<'PROMPT_EOF' > "${AI_REVIEW_DIR}/review-prompt.txt"
+          You are an orchestrator agent performing automated code review in a GitHub Actions runner.
+          The gh CLI is available and authenticated via GH_TOKEN.
+
+          ${{ inputs.review_plugin != '' && format('review_plugin input is "{0}" — OpenCode does not load Anthropic Claude marketplace plugins here; apply equivalent rules from AGENTS.md or project docs if documented.', inputs.review_plugin) || '' }}
+
+          Context:
+          - Repo: ${{ github.repository }}
+          - PR Number: ${{ github.event.pull_request.number }}
+          - PR Head SHA: ${{ github.event.pull_request.head.sha }}
+          - PR Base SHA: ${{ github.event.pull_request.base.sha }}
+
+          Pre-computed data (paths are inside the repo worktree — read these files directly; do not use /tmp):
+          - Changed file list: .ai-review-work/changed-files.txt
+          - Full diff: .ai-review-work/pr-diff.txt
+          - PR file patches (filename + patch): .ai-review-work/pr-patches.json
+          - Bot's existing inline review comments: .ai-review-work/bot-review-comments.json
+            (root-level only; fields: id, path, line, original_line, body truncated to 200 chars)
+          - Bot's existing reply comments: .ai-review-work/bot-reply-comments.json
+            (fields: id, in_reply_to_id, body truncated to 200 chars)
+          - Bot's existing top-level issue comments: .ai-review-work/bot-issue-comments.json
+            (fields: id, body)
+          You MAY use gh api for write operations (POST, PATCH, DELETE) only.
+
+          Changed files:
+          ${{ steps.pr-diff.outputs.changed_files }}
+
+          ## Preparation
+
+          Before spawning subagents:
+          1. Read AGENTS.md, CLAUDE.md, .claude/CLAUDE.md, .claude/rules/, and any AGENTS.md
+             in directories touched by the PR. Repo-specific rules take precedence.
+          2. Read the diff from .ai-review-work/pr-diff.txt and patches from .ai-review-work/pr-patches.json.
+          3. Categorize existing bot comments (see Comment Lifecycle below).
+
+          ## Review Strategy
+
+          Based on the diff, decide how many subagents to spawn (1–4) and what each should
+          focus on. Choose only the dimensions that are relevant to the actual changes —
+          do not force dimensions that don't apply.
+
+          Example dimensions (not exhaustive — adapt to the diff):
+          - Code simplification: opportunities to reduce complexity, remove dead code,
+            consolidate duplicated logic
+          - Security: vulnerabilities, injection, insecure patterns, data flow risks
+          - Performance: scalability, resource waste, latency, inefficient patterns
+          - Documentation alignment: do docs reflect the current code? If features were
+            added, are they documented? If features were removed, is stale documentation
+            cleaned up? Are demo docs and examples updated with new scenarios?
+          - Test coverage: do new features have corresponding tests? Are removed features'
+            tests cleaned up?
+          - Best practices: does the implementation follow framework/platform conventions
+            and idiomatic patterns for the technology stack?
+          - Data integrity: schema changes, migration safety, backward compatibility
+          - API design: contract changes, breaking changes, versioning
+          - Infrastructure: misconfiguration, resource limits, IAM permissions
+
+          Each subagent should read the changed files and their surrounding context
+          (imports, callers, related modules) to understand the full picture.
+
+          Review principles:
+          - Focus on what matters — skip style nits, naming preferences, trivial refactors.
+          - Never suggest changing what the code does — only how it does it. All original
+            features, outputs, and behaviors must remain intact.
+          - When a change in logic appears necessary, flag it for the author to decide
+            rather than prescribing a fix.
+          - For documentation: if features were removed, flag stale docs for removal.
+            If features were added, flag missing documentation.
+
+          ## Comment Lifecycle Management
+
+          Categorize existing bot comments before spawning subagents:
+          - ACTIVE: review comment whose path is in the diff and whose effective line
+            (line if non-null, else original_line) falls within a changed hunk.
+          - STALE: review comment whose file is NOT in the diff, OR whose effective
+            line does not fall within any changed hunk.
+          - SUMMARY: top-level issue comment containing <!-- ai-review-summary -->.
+          - NO_ISSUES: top-level issue comment matching "no issues"/"LGTM" etc.
+            without the <!-- ai-review-summary --> marker.
+
+          After subagents complete, follow these steps IN ORDER:
+
+          Step A — Deduplicate: merge findings on the same file+line into one comment.
+
+          Step B — Handle STALE comments: check .ai-review-work/bot-reply-comments.json for existing
+          "Resolved" replies. If none, reply in-thread:
+          gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
+            -f body="Resolved — this line is no longer part of the diff." \
+            -F in_reply_to=<id>
+          On failure (HTTP 422), log and continue.
+
+          Step C — Match new findings against ACTIVE comments:
+          - Same file+line, similar content: SKIP.
+          - Same file+line, different issue: reply in-thread via in_reply_to.
+            On failure, fall back to a new standalone inline comment.
+          - No existing comment: post new inline comment:
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
+              -f body="<message>" -f commit_id="${{ github.event.pull_request.head.sha }}" \
+              -f path="<file>" -F line=<N> -f side="RIGHT"
+          Track all matched ACTIVE comments in a "handled" set.
+
+          Step D — Resolve fixed ACTIVE comments (skip "handled" set): check for existing
+          "resolved" replies. If none, reply in-thread:
+          gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
+            -f body="This issue appears resolved by recent changes." \
+            -F in_reply_to=<id>
+
+          Step E — Delete all NO_ISSUES comments:
+          gh api -X DELETE repos/${{ github.repository }}/issues/comments/{id}
+
+          Step F — Update or create summary comment:
+          Find comments with <!-- ai-review-summary --> marker. Keep lowest id, delete
+          duplicates. PATCH the survivor or create new if none exists.
+          Body MUST start with <!-- ai-review-summary --> as the very first line.
+          Include: total findings, breakdown by dimension, resolved/deleted count.
+
+          Rules:
+          - Never post a top-level comment for something that should be inline.
+          - All inline comments MUST target changed lines with correct diff positions.
+          - Prefer reply-in-thread over DELETE to preserve human replies.
+          - Check exit codes on every mutating gh api call; log errors and continue.
+          - Do NOT re-fetch comments at runtime — use only the pre-computed files.
+          PROMPT_EOF
+
+          # max_turns input is informational for operators; this opencode build has no --max-turns on `run`.
+          # --title avoids the default session header "build · <model>" (this job is review, not app build).
+          # Run without exec so the shell remains the step process and opencode's exit code is the step outcome.
+          opencode run \
+            --title "AI code review · PR #${{ github.event.pull_request.number }}" \
+            -m "amazon-bedrock/${MODEL}" \
+            "${EXTRA_LOG[@]}" \
+            "$(cat "${AI_REVIEW_DIR}/review-prompt.txt")"
+
+      - name: Approve PR when no unresolved bot review threads
+        if: >-
+          steps.generated-check.outputs.skip_review != 'true' &&
+          steps.opencode-review.outcome == 'success' &&
+          inputs.approve_when_clean == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APP_SLUG}" ]; then
+            echo "::error::APP_SLUG missing from app token step"
+            exit 1
+          fi
+          BOT_LOGIN="${APP_SLUG}[bot]"
+          GQL_THREADS='
+            query($owner: String!, $name: String!, $pr: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $pr) {
+                  reviewThreads(first: 100) {
+                    nodes {
+                      isResolved
+                      comments(first: 50) {
+                        nodes { author { login } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          '
+          count_unresolved_bot_threads() {
+            gh api graphql -f query="${GQL_THREADS}" \
+              -f owner="${REPO_OWNER}" -f name="${REPO_NAME}" -F pr="${PR_NUMBER}" \
+              | jq --arg bot "${BOT_LOGIN}" '
+                  [.data.repository.pullRequest.reviewThreads.nodes[]
+                   | select(.isResolved == false)
+                   | select(any(.comments.nodes[]; .author.login == $bot))
+                  ] | length
+                '
+          }
+          # New threads from OpenCode/gh api may lag in GraphQL (eventual consistency); wait before checking.
+          echo "::group::Unresolved bot thread check"
+          echo "Waiting 30s for GitHub to index new review threads..."
+          sleep 30
+          UNRESOLVED="$(count_unresolved_bot_threads)"
+          echo "Unresolved bot threads: ${UNRESOLVED}"
+          echo "::endgroup::"
+          if [ "${UNRESOLVED}" -gt 0 ]; then
+            echo "::notice::Skipping approval: ${UNRESOLVED} unresolved review thread(s) involving ${BOT_LOGIN}"
+            exit 0
+          fi
+          echo "::notice::Submitting approving review for PR #${PR_NUMBER} (no unresolved bot inline threads)"
+          gh pr review "${PR_NUMBER}" --approve --body "AI review: no unresolved inline threads from ${BOT_LOGIN}."
