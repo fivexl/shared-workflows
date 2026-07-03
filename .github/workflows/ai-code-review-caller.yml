@@ -1,6 +1,6 @@
 name: ai-code-review-caller
 
-# SECRETS: APP_ID, APP_PRIVATE_KEY, BEDROCK_ROLE_ARN
+# SECRETS: APP_ID, APP_PRIVATE_KEY, DEVELOPMENT_ACCOUNT_ROLE_ARN
 
 # Caller workflow for the .github repo itself. Triggers on pull request
 # events and calls the shared ai-code-review workflow.
@@ -30,4 +30,4 @@ jobs:
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-      BEDROCK_ROLE_ARN: ${{ secrets.BEDROCK_ROLE_ARN }}
+      BEDROCK_ROLE_ARN: ${{ secrets.DEVELOPMENT_ACCOUNT_ROLE_ARN }}

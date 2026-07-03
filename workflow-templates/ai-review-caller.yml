@@ -5,7 +5,7 @@ name: AI Review
 # workflow in the .github repo. Copy this file to your repo's
 # .github/workflows/ directory or adopt via the "New workflow" UI.
 #
-# Required org-level secrets: APP_ID, APP_PRIVATE_KEY, BEDROCK_ROLE_ARN
+# Required org-level secrets: APP_ID, APP_PRIVATE_KEY, DEVELOPMENT_ACCOUNT_ROLE_ARN
 
 on:
   pull_request:
@@ -39,4 +39,4 @@ jobs:
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
-      BEDROCK_ROLE_ARN: ${{ secrets.BEDROCK_ROLE_ARN }}
+      BEDROCK_ROLE_ARN: ${{ secrets.DEVELOPMENT_ACCOUNT_ROLE_ARN }}
