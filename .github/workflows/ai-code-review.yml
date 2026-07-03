@@ -471,11 +471,20 @@ jobs:
               summary_file = WORK_DIR / "summary-comment-id.txt"
               summary_id = summary_file.read_text().strip() if summary_file.is_file() else ""
               if summary_id:
-                  if gh_mutate(["-X", "PATCH", f"repos/{REPO}/issues/comments/{summary_id}",
-                                "-f", f"body={body}"],
-                               f"Failed to update summary comment {summary_id}"):
+                  res = run(["gh", "api", "-X", "PATCH",
+                             f"repos/{REPO}/issues/comments/{summary_id}",
+                             "-f", f"body={body}"], check=False)
+                  if res.returncode == 0:
                       log(f"Updated summary comment {summary_id}")
                       return True
+                  err = (res.stderr or "").strip()
+                  warn(f"Failed to update summary comment {summary_id}: {err[:300]}")
+                  # Only fall through to creation when the comment is actually
+                  # gone (deleted); a transient failure must not duplicate the
+                  # summary.
+                  if "HTTP 404" not in err:
+                      return False
+                  log("Existing summary comment is gone — creating a new one")
               if gh_mutate([f"repos/{REPO}/issues/{PR_NUMBER}/comments", "-f", f"body={body}"],
                            "Failed to create summary comment"):
                   log("Created new summary comment")
