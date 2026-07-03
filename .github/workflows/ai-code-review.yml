@@ -230,6 +230,13 @@ jobs:
                           return path.read_text()
                   except OSError:
                       pass
+              # Agents sometimes pass a whole multi-line body as ONE line of
+              # literal \n escapes (bash does not expand \n in quotes). Only
+              # repair the unambiguous case — many \n, zero real newlines — so
+              # a genuine mention of "\n" in a short message is left alone.
+              if "\n" not in arg and arg.count("\\n") >= 3:
+                  warn("Body contains literal \\n escapes and no newlines — unescaping (use @<path> for multi-line bodies)")
+                  return arg.replace("\\n", "\n")
               return arg
 
 
@@ -547,7 +554,11 @@ jobs:
                   if mut.returncode == 0:
                       resolved += 1
                   else:
-                      warn(f"Failed to resolve thread {node['id']}")
+                      # gh api graphql puts GraphQL errors on stderr; "Resource not
+                      # accessible by integration" means the app lacks Contents R/W
+                      # (GitHub requires it for resolveReviewThread — see README).
+                      err = (mut.stderr or mut.stdout or "").strip()[:300]
+                      warn(f"Failed to resolve thread {node['id']}: {err}")
                       failed += 1
               log(f"Resolved {resolved} thread(s), {failed} failure(s)")
 
@@ -820,6 +831,9 @@ jobs:
           - All inline comments MUST target changed lines only.
           - Prefer reply-in-thread over delete to preserve human replies.
           - Do NOT re-fetch comments from the API — use only the pre-computed files.
+          - NEVER put literal \n escape sequences in a body argument — bash does
+            not expand them, so they are posted verbatim. For any multi-line body
+            write a file with a heredoc and pass @<path>.
           AGENT_EOF
 
           echo "Wrote OpenCode agent definitions:"

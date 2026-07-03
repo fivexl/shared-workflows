@@ -117,8 +117,9 @@ App**):
 
 | Permission | Access | Used for |
 |---|---|---|
-| Pull requests | Read and write | inline review comments, replies, thread resolution |
+| Pull requests | Read and write | inline review comments and replies |
 | Issues | Read and write | the summary comment (PR top-level comments use the issues API) |
+| Contents | Read and write | resolving review threads — GitHub's `resolveReviewThread` GraphQL mutation fails with "Resource not accessible by integration" without it |
 | Metadata | Read | mandatory, added automatically |
 
 After creating the app:
@@ -229,8 +230,10 @@ never the PR branch.
   forks.
 - CLI binaries (OpenCode, bmcp) are installed from release assets pinned by
   version **and** SHA-256; a checksum mismatch fails the job.
-- The reviewer's GitHub App carries the minimum permission set (pull
-  requests, issues); it cannot push code, approve PRs, or read secrets.
+- The reviewer's GitHub App carries the minimum permission set that works
+  (pull requests, issues, contents); contents write is only there because
+  GitHub requires it for resolving review threads — the workflow itself never
+  pushes code, approves PRs, or reads secrets.
 
 ## License
 
