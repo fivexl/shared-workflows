@@ -658,6 +658,13 @@ jobs:
             || echo "::warning::bmcp init failed — BORIS tools will be unavailable"
           bmcp sync --non-interactive \
             || echo "::warning::bmcp sync failed — BORIS tools may be unavailable"
+          # Write BORIS usage instructions into the worktree (AGENTS.md et al,
+          # appended inside markers — existing files are never overwritten).
+          # OpenCode reads AGENTS.md at session start, so the orchestrator and
+          # subagents discover bmcp and the synced tool list on their own.
+          # Runs after sync so the embedded tool list is fresh.
+          bmcp install all --scope project \
+            || echo "::warning::bmcp install failed — agents may not discover BORIS tools"
           bmcp doctor --non-interactive \
             || echo "::warning::bmcp doctor reported problems"
 
