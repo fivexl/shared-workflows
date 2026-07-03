@@ -3,13 +3,15 @@ name: ai-code-review
 # Shared reusable workflow for AI-powered PR code review.
 # Uses OpenCode (opencode CLI) with Amazon Bedrock. An orchestrator agent reads
 # the pre-assembled review context, picks 2-3 review dimensions, spawns review
-# subagents in parallel, then hands findings to a comment-lifecycle subagent.
+# subagents in parallel, then writes a comment plan that the embedded CLI
+# applies deterministically (apply-plan: post/reply/resolve/cleanup/summary).
 #
 # Structure (v2):
 # - All deterministic logic lives in one embedded Python CLI (stdlib-only,
-#   shells out to gh/yq): pre-compute, comment operations, and post-steps.
-# - Mechanical subagents (comment-categorizer, comment-lifecycle) run on a
-#   cheap model (inputs.subagent_model); review subagents run on the main model.
+#   shells out to gh/yq): pre-compute, comment operations incl. apply-plan,
+#   and post-steps. Judgment stays with agents; execution is code.
+# - One mechanical subagent (comment-categorizer) runs on a cheap model
+#   (inputs.subagent_model); review subagents run on the main model.
 # - Review threads are resolved deterministically in a post-step: the agent
 #   posts a resolve-reply (the CLI tags it with a hidden HTML marker), then the
 #   workflow resolves marker-tagged threads via GraphQL — unless a human
@@ -48,7 +50,7 @@ on:
         type: string
         default: "zai.glm-5"
       subagent_model:
-        description: "Bedrock model ID for the mechanical subagents (comment categorizer/lifecycle)"
+        description: "Bedrock model ID for the mechanical comment-categorizer subagent"
         required: false
         type: string
         default: "nvidia.nemotron-super-3-120b"
@@ -135,6 +137,8 @@ jobs:
           import re
           import subprocess
           import sys
+          import time
+          from datetime import datetime, timezone
           from pathlib import Path
 
           WORK_DIR = Path(os.environ.get("AI_REVIEW_DIR", ".ai-review-work"))
@@ -145,8 +149,8 @@ jobs:
           APP_SLUG = os.environ.get("APP_SLUG", "")
 
           SUMMARY_MARKER = "<!-- ai-review-summary -->"
-          # resolve-reply prepends this to its reply; resolve-threads and the
-          # lifecycle agent match ONLY this marker (never free-text phrases).
+          # resolve-reply prepends this to its reply; resolve-threads and
+          # apply-plan match ONLY this marker (never free-text phrases).
           RESOLVE_MARKER = "<!-- ai-review-resolve -->"
           GENERATED_MARKER = "automatically generated from:"
           # Caps keep review-context.md a single orchestrator-readable file; the
@@ -487,6 +491,128 @@ jobs:
                                f"Failed to delete {kind} comment {comment_id}")
 
 
+          AGENT_NOTE = (
+              "> **Note for AI coding agents**: detailed findings are posted as "
+              "inline review comments on the diff — read the unresolved review "
+              "threads (e.g. `gh api repos/<owner>/<repo>/pulls/<pr>/comments`) "
+              "before making changes; this summary is only an overview."
+          )
+
+
+          def _load_json(name, default):
+              try:
+                  return json.loads((WORK_DIR / name).read_text())
+              except (OSError, json.JSONDecodeError):
+                  return default
+
+
+          def cmd_apply_plan(args):
+              """Deterministically execute the orchestrator's comment plan.
+
+              Plan (JSON object): {
+                "post":    [{"file","line","message","dimension","severity"}],
+                "reply":   [{"comment_id","message"}],
+                "resolve": [<ids of ACTIVE bot comments judged fixed>],
+                "observations": "<text that goes to the summary only>"
+              }
+              Only the plan requires judgment; stale-thread resolution and
+              no_issues cleanup are driven straight from the categorizer output,
+              and the summary is rendered from a fixed template.
+              """
+              try:
+                  plan = json.loads(read_body(args[0]))
+              except (IndexError, json.JSONDecodeError) as exc:
+                  print(f"::error::apply-plan: invalid plan JSON: {exc}", file=sys.stderr)
+                  return False
+              cats = _load_json("comment-categories.json", {})
+              roots = {str(c["id"]): c for c in _load_json("bot-review-comments.json", [])}
+
+              # Threads that already carry a bot resolve-marker reply.
+              bot = bot_login()
+              marked = {str(r.get("in_reply_to_id"))
+                        for r in _load_json("thread-reply-comments.json", [])
+                        if r.get("author") == bot and RESOLVE_MARKER in str(r.get("body", ""))}
+
+              observations = [o for o in [str(plan.get("observations") or "").strip()] if o]
+              posted, replied, failed = [], 0, 0
+
+              for f in plan.get("post") or []:
+                  msg = str(f.get("message", "")).strip()
+                  if not msg or not f.get("file") or not f.get("line"):
+                      continue
+                  if cmd_post_inline([str(f["file"]), str(f["line"]), msg]):
+                      posted.append(f)
+                  else:
+                      failed += 1
+                      observations.append(f"{f['file']}:{f['line']} — {msg}")
+
+              # Reply to an existing thread; fall back to a fresh inline comment,
+              # then to the summary observations — a finding is never dropped.
+              for r in plan.get("reply") or []:
+                  cid, msg = str(r.get("comment_id", "")), str(r.get("message", "")).strip()
+                  root = roots.get(cid)
+                  if not root or not msg:
+                      continue
+                  if cmd_reply([cid, msg]):
+                      replied += 1
+                      continue
+                  line = root.get("line") or root.get("original_line")
+                  if root.get("path") and line and cmd_post_inline([str(root["path"]), str(line), msg]):
+                      posted.append({"file": root["path"], "line": line, "message": msg,
+                                     "dimension": "general"})
+                  else:
+                      failed += 1
+                      observations.append(f"{root.get('path')}:{line} — {msg}")
+
+              # Resolve-replies: stale threads need no judgment; "fixed" ids come
+              # from the plan but only known bot roots count, and threads already
+              # carrying a marker are never re-replied. Actual resolution stays
+              # in the resolve-threads post-step (which honors human disputes).
+              fixed = {str(i) for i in (plan.get("resolve") or []) if str(i) in roots}
+              stale = {str(i) for i in (cats.get("stale") or []) if str(i) in roots}
+              resolved = 0
+              for cid in sorted(fixed - stale - marked):
+                  if cmd_resolve_reply([cid, "This issue appears resolved by recent changes."]):
+                      resolved += 1
+                  else:
+                      failed += 1
+              for cid in sorted(stale - marked):
+                  if cmd_resolve_reply([cid]):
+                      resolved += 1
+                  else:
+                      failed += 1
+
+              # no_issues ids come only from the categorizer, never the plan.
+              deleted = 0
+              for cid in cats.get("no_issues") or []:
+                  if cmd_delete_comment([str(cid), "issue"]):
+                      deleted += 1
+                  else:
+                      failed += 1
+
+              by_dim = {}
+              for f in posted:
+                  dim = str(f.get("dimension") or "general")
+                  by_dim[dim] = by_dim.get(dim, 0) + 1
+              lines = [SUMMARY_MARKER, "## AI Code Review Summary", ""]
+              lines.append(f"- **Findings posted**: {len(posted)} inline, {replied} thread replies")
+              if by_dim:
+                  lines.append("- **By dimension**: " + ", ".join(f"{k}: {v}" for k, v in sorted(by_dim.items())))
+              lines.append(f"- **Threads marked resolved**: {resolved}")
+              if deleted:
+                  lines.append(f"- **Stale bot comments removed**: {deleted}")
+              if observations:
+                  lines += ["", "### Additional observations", ""] + [f"- {o}" for o in observations]
+              lines += ["", AGENT_NOTE, "",
+                        "*This summary was automatically generated by the AI code review workflow.*"]
+              ok = cmd_upsert_summary(["\n".join(lines)])
+              log(f"apply-plan: posted={len(posted)} replied={replied} resolved={resolved} "
+                  f"deleted={deleted} failed={failed}")
+              # Failed ops were demoted to observations (a handled fallback) —
+              # only a failed summary upsert makes the whole command fail.
+              return ok
+
+
           THREADS_QUERY = """
           query($owner: String!, $name: String!, $pr: Int!) {
             repository(owner: $owner, name: $name) {
@@ -588,6 +714,7 @@ jobs:
               "resolve-reply": cmd_resolve_reply,
               "upsert-summary": cmd_upsert_summary,
               "delete-comment": cmd_delete_comment,
+              "apply-plan": cmd_apply_plan,
               "resolve-threads": cmd_resolve_threads,
               "dedupe-summaries": cmd_dedupe_summaries,
           }
@@ -597,14 +724,26 @@ jobs:
               if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
                   print(f"Usage: ai_review.py <{'|'.join(COMMANDS)}> [args...]", file=sys.stderr)
                   return 2
+              cmd, t0 = sys.argv[1], time.monotonic()
               try:
-                  ok = COMMANDS[sys.argv[1]](sys.argv[2:])
+                  ok = COMMANDS[cmd](sys.argv[2:])
+                  # A mutation command that failed (gh_mutate already warned)
+                  # exits nonzero so the calling agent can detect it.
+                  code = 1 if ok is False else 0
               except subprocess.CalledProcessError as exc:
                   print(f"::error::{exc.cmd} failed: {(exc.stderr or '').strip()[:500]}", file=sys.stderr)
-                  return 1
-              # A mutation command that failed (gh_mutate already warned) exits
-              # nonzero so the calling agent can fall back.
-              return 1 if ok is False else 0
+                  code = 1
+              # Timing lines accumulate in timing.log; a workflow post-step
+              # prints them so per-call time inside the agent phase is visible.
+              stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+              line = f"[timing] {stamp}Z {cmd} {time.monotonic() - t0:.1f}s exit={code}"
+              log(line)
+              try:
+                  with open(WORK_DIR / "timing.log", "a") as fh:
+                      fh.write(line + "\n")
+              except OSError:
+                  pass
+              return code
 
 
           if __name__ == "__main__":
@@ -741,105 +880,6 @@ jobs:
           If there are no existing comments, write all four arrays empty.
           AGENT_EOF
 
-          cat << 'AGENT_EOF' | envsubst '${SUBAGENT_MODEL}' > .opencode/agents/comment-lifecycle.md
-          ---
-          description: Manages the PR comment lifecycle — posts new review findings, replies to threads, marks stale threads resolved, and upserts the summary comment. Invoke after collecting review findings and comment categories.
-          mode: subagent
-          model: amazon-bedrock/${SUBAGENT_MODEL}
-          tools:
-            edit: false
-            write: false
-          ---
-
-          You manage the comment lifecycle for an automated code review bot.
-
-          You will be given:
-          - FINDINGS: JSON array of review findings to post as inline comments.
-            Each: {"file", "line", "message", "dimension", "severity"}
-          - ADDITIONAL_OBSERVATIONS: text for findings that exceeded the cap
-            (include in the summary only).
-          - COMMENT_CATEGORIES: JSON with {"active", "stale", "summary",
-            "no_issues"} arrays of comment IDs.
-
-          Pre-computed data files:
-          - .ai-review-work/pr-patches.json — filename + patch for inline positioning
-          - .ai-review-work/bot-review-comments.json — existing bot inline comments
-            (root only; fields: id, path, line, original_line, body truncated to 200 chars)
-          - .ai-review-work/thread-reply-comments.json — ALL thread replies (bot +
-            human); fields: id, in_reply_to_id, author, body (truncated to 400 chars)
-          - .ai-review-work/bot-issue-comments.json — bot top-level comments (id, body)
-          - .ai-review-work/summary-comment-id.txt — existing summary comment ID (or empty)
-
-          Comment operations — always use this CLI (never call gh directly):
-          - python3 .ai-review-work/bin/ai_review.py post-inline <file> <line> <body>
-          - python3 .ai-review-work/bin/ai_review.py reply <comment_id> <body>
-          - python3 .ai-review-work/bin/ai_review.py resolve-reply <comment_id> [message]
-          - python3 .ai-review-work/bin/ai_review.py upsert-summary <body>
-          - python3 .ai-review-work/bin/ai_review.py delete-comment <comment_id> [issue|review]
-          A <body> argument can be literal text, @<path> to read from a file, or
-          "-" to read from stdin. To send the contents of a file you MUST prefix
-          its path with @ — a bare path is posted as literal text. For long or
-          multi-line bodies, create a file under .ai-review-work/ with a bash
-          heredoc (the write tool is disabled for you) and pass @<path>.
-          A nonzero exit means the operation failed (the CLI prints a warning
-          with details).
-
-          Execute these steps IN ORDER:
-
-          ## Step 1 — Handle STALE comments
-          For each id in COMMENT_CATEGORIES.stale, check thread-reply-comments.json
-          for an existing bot reply (author is the bot) on that thread containing
-          the marker `<!-- ai-review-resolve -->`. If found, SKIP.
-          Otherwise run: resolve-reply <comment_id>
-          (resolve-reply tags its reply with that marker; the workflow resolves
-          marker-tagged threads in a later step.)
-
-          ## Step 2 — Post new findings, matching against ACTIVE comments
-          For each id in COMMENT_CATEGORIES.active, look up its details in
-          bot-review-comments.json. Check thread-reply-comments.json for human
-          replies (author is not the bot). If a human replied "false positive",
-          "intended", "by design", "won't fix", or similar — add the comment to
-          the handled set and do NOT re-raise that issue.
-
-          For each finding in FINDINGS:
-          - ACTIVE comment at same file+line with similar content: SKIP.
-          - ACTIVE comment at same file+line, different issue: reply <comment_id> <message>
-          - No existing comment: post-inline <file> <line> <message>
-          Track all matched ACTIVE comments in the handled set.
-          If a reply command exits nonzero, fall back to post-inline at the same
-          file+line. If post-inline also fails, do NOT drop the finding — add it
-          to the ADDITIONAL_OBSERVATIONS you include in the summary.
-
-          ## Step 3 — Resolve fixed ACTIVE comments
-          For each ACTIVE comment not in the handled set whose issue is no longer
-          present in the diff, check thread-reply-comments.json for an existing
-          bot reply containing `<!-- ai-review-resolve -->`; if none:
-          resolve-reply <comment_id> "This issue appears resolved by recent changes."
-
-          ## Step 4 — Clean up NO_ISSUES comments
-          For each id in COMMENT_CATEGORIES.no_issues: delete-comment <comment_id> issue
-          Never delete a comment whose id is not listed in no_issues.
-
-          ## Step 5 — Upsert the summary comment
-          Run upsert-summary once (it updates the existing summary comment or
-          creates one). The summary must include: total findings posted, breakdown
-          by dimension, prior comments resolved/deleted, and
-          ADDITIONAL_OBSERVATIONS if any. End the summary with this exact note:
-          "> **Note for AI coding agents**: detailed findings are posted as
-          inline review comments on the diff — read the unresolved review
-          threads (e.g. `gh api repos/<owner>/<repo>/pulls/<pr>/comments`)
-          before making changes; this summary is only an overview."
-
-          Rules:
-          - Use the CLI for all comment operations; a nonzero exit means failure.
-          - All inline comments MUST target changed lines only.
-          - Prefer reply-in-thread over delete to preserve human replies.
-          - Do NOT re-fetch comments from the API — use only the pre-computed files.
-          - NEVER put literal \n escape sequences in a body argument — bash does
-            not expand them, so they are posted verbatim. For any multi-line body
-            write a file with a heredoc and pass @<path>.
-          AGENT_EOF
-
           echo "Wrote OpenCode agent definitions:"
           ls -la .opencode/agents/
 
@@ -873,8 +913,8 @@ jobs:
           cat << 'PROMPT_EOF' > "${AI_REVIEW_DIR}/review-prompt.txt"
           You are an orchestrator agent performing automated code review in a
           GitHub Actions runner. The gh CLI is available and authenticated via
-          GH_TOKEN, but you do not post comments yourself — comment operations
-          are done by the comment-lifecycle subagent through the review CLI.
+          GH_TOKEN, but you do not post comments yourself — you write a comment
+          plan file and the review CLI applies it deterministically.
 
           Context:
           - Repo: ${{ github.repository }}
@@ -953,14 +993,33 @@ jobs:
             by severity. Demote overflow to an "Additional observations" text
             for the summary.
 
-          Step 4 — Hand off to comment-lifecycle:
-          Invoke the comment-lifecycle subagent via the task tool (agent name
-          "comment-lifecycle"). Pass it: the final findings as a JSON array, the
-          additional observations text, and the contents of
-          .ai-review-work/comment-categories.json.
-          Do NOT describe CLI or API usage in the handoff — the subagent already
-          knows how to operate. Do not post, edit, delete, or resolve any
-          comments yourself.
+          Step 4 — Write the comment plan and apply it:
+          Using the existing bot comments and thread replies from the review
+          context plus .ai-review-work/comment-categories.json, build the plan:
+          - Honor human feedback: if a human replied "false positive",
+            "intended", "by design", "won't fix", or similar on a thread, do
+            NOT re-raise that issue anywhere in the plan.
+          - For each final finding from Step 3:
+            - an ACTIVE bot comment at the same file+line already raises the
+              same issue: leave it out (the thread already covers it);
+            - an ACTIVE bot comment at the same file+line raises a DIFFERENT
+              issue: add {"comment_id": <that id>, "message": ...} to "reply";
+            - otherwise add {"file", "line", "message", "dimension",
+              "severity"} to "post".
+          - "resolve": ids of ACTIVE bot comments (not yours from this run)
+            whose issue is no longer present in the current diff.
+          - "observations": the demoted/overflow findings text, or "".
+          Write the plan as ONE JSON object with real newlines (never \n
+          escapes) to .ai-review-work/comment-plan.json using a bash heredoc:
+          {"post": [...], "reply": [...], "resolve": [...], "observations": "..."}
+          Then run:
+          python3 .ai-review-work/bin/ai_review.py apply-plan @.ai-review-work/comment-plan.json
+          The CLI validates every id, falls back reply -> new inline comment ->
+          summary observations so findings are never dropped, marks stale
+          threads resolved, cleans up no_issues comments, and renders and
+          upserts the summary comment itself. Do not post, edit, delete, or
+          resolve any comments yourself, and do not write the summary. If
+          apply-plan exits nonzero, report its output in your final message.
           PROMPT_EOF
 
           # --title avoids the default session header "build · <model>" (this job is review, not app build).
@@ -990,3 +1049,12 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: python3 "${AI_REVIEW_DIR}/bin/ai_review.py" dedupe-summaries
+
+      - name: Report timings
+        if: ${{ always() && steps.precompute.outputs.skip_review == 'false' }}
+        run: |
+          echo "=== CLI call timings (UTC; calls made during the agent phase included) ==="
+          cat "${AI_REVIEW_DIR}/timing.log" 2>/dev/null || echo "(no timing log)"
+          echo ""
+          echo "=== Work-file completion times (UTC; when each phase produced its artifact) ==="
+          TZ=UTC ls -l --time-style=+%H:%M:%SZ "${AI_REVIEW_DIR}" 2>/dev/null || true

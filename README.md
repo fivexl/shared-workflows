@@ -84,7 +84,7 @@ Optional workflow inputs:
 | Input | Default | Purpose |
 |---|---|---|
 | `model` | `zai.glm-5` | Bedrock model for the orchestrator and review subagents |
-| `subagent_model` | `nvidia.nemotron-super-3-120b` | Cheaper model for mechanical subagents (comment categorization/lifecycle) |
+| `subagent_model` | `nvidia.nemotron-super-3-120b` | Cheaper model for the mechanical comment-categorizer subagent |
 | `max_comments` | `10` | Inline comment cap per run; overflow lands in the summary |
 | `aws_region` | `us-east-1` | Bedrock region |
 | `boris_mcp_url` | _(empty)_ | Enable BORIS live-infrastructure context (see below) |
