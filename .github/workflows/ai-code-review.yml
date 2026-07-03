@@ -51,7 +51,7 @@ on:
         description: "Bedrock model ID for the mechanical subagents (comment categorizer/lifecycle)"
         required: false
         type: string
-        default: "google.gemma-3-27b-it"
+        default: "nvidia.nemotron-super-3-120b"
       max_comments:
         description: "Max inline review comments per run; overflow findings go to the summary"
         required: false
