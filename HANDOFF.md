@@ -23,6 +23,113 @@ Implementation notes (delta vs. the plan below):
 - First real-PR run should watch: OpenCode task-tool subagent invocation by
   name, and Nemotron's reliability on the categorizer/lifecycle roles.
 
+## Code review findings (2026-07-03, multi-agent review of the v2 commit — NOT yet fixed)
+
+Ranked by severity. Line numbers refer to .github/workflows/ai-code-review.yml
+at commit ba15c2e. Findings 1-5 should be fixed before shipping.
+
+1. **NO_ISSUES deletes unrelated bot comments** (line ~661, categorizer def +
+   lifecycle Step 4). The categorizer classifies EVERY bot top-level comment
+   lacking `<!-- ai-review-summary -->` as NO_ISSUES and lifecycle deletes them
+   all. Old prompt only deleted "no issues"/"LGTM"-style comments. If the org
+   reuses the same GitHub App for other automation (deploy previews, coverage
+   comments), every review run permanently deletes those comments.
+   Fix: restore the narrow definition (delete only bot comments that look like
+   "no issues"/"LGTM" AND lack the marker), or tag review comments with their
+   own marker and only ever delete marked ones.
+
+2. **RESOLVED_RE is an unanchored substring match** (line ~150). `(?i)resolved`
+   matches "unresolved" and any ordinary bot reply containing the word; the
+   lifecycle agent's Step 2 posts substantive bot replies to ACTIVE threads, so
+   a reply like "this promise is never resolved" gets the thread auto-resolved
+   by the post-step while carrying a live finding. Related drift: Step 1's
+   skip-check phrases ("Resolved", "no longer part of the diff") don't match
+   Step 3's message ("This issue appears resolved by recent changes."), and the
+   magic phrases live in 3 places (Python regex, resolve-reply default, agent
+   prose).
+   Fix (one mechanism for all three): have `resolve-reply` append a hidden
+   structured marker (e.g. `<!-- ai-review-resolve -->`, mirroring
+   SUMMARY_MARKER) and have resolve-threads + the agent's skip-check match ONLY
+   that marker. Remove the phrase literals from the prompts.
+
+3. **resolve-threads fights human un-resolution** (line ~492). It resolves any
+   unresolved bot-rooted thread containing ANY historical bot reply matching
+   RESOLVED_RE — order-blind `any()` over replies, no check for later human
+   comments. A human who unresolves a thread to dispute gets it re-resolved and
+   buried on every push. The GraphQL query already fetches ordered
+   authors/bodies.
+   Fix: skip resolution if any non-bot comment appears after the bot's
+   resolution-marker reply (and/or if the last comment is human).
+
+4. **Null-user crash in precompute/dedupe** (lines ~368, 381, 521).
+   `c.get("user", {}).get("login")` raises AttributeError when `user` is
+   present but JSON null (deleted account / ghost user; GitHub schema marks it
+   nullable). One such comment hard-fails the review job on every push. Old
+   jq version tolerated null. main() catches only CalledProcessError.
+   Fix: `(c.get("user") or {}).get("login")` everywhere.
+
+5. **additional_dimensions accepts a scalar and iterates chars** (line ~261).
+   `additional_dimensions: iac` (scalar YAML) → yq JSON string → the for-loop
+   iterates 'i','a','c', each passes the single-char sanitizer regex → the
+   orchestrator is told to force dimensions "i, a, c".
+   Fix: `if not isinstance(dims, list): dims = [dims]` (or reject with warning).
+
+6. **Reply-failure fallback dropped** (lifecycle Step 2, line ~727). Old prompt:
+   "On failure, fall back to a new standalone inline comment." New CLI's
+   gh_mutate warns-and-exits-0, so the agent can't detect failure from exit
+   codes and a real finding is silently dropped on HTTP 422.
+   Fix: nonzero exit from the CLI on mutation failure (agent sees it), and
+   restore the fallback instruction in the lifecycle prompt.
+
+7. **read_body '@' convention collides with @mentions** (line ~210). A literal
+   body starting with '@' (natural in replies) is treated as a file path;
+   FileNotFoundError is uncaught (main catches only CalledProcessError) → CLI
+   traceback, comment lost.
+   Fix: catch OSError in read_body and fall back to literal text (or require
+   an explicit `--body-file` flag instead of the @ convention).
+
+8. **Falsy-zero max_comments** (line ~255). `cfg.get("max_comments") or default`
+   treats configured `max_comments: 0` (unquoted int) as missing → silently 10,
+   no warning; quoted "0" works. Same pattern on max_turns.
+   Fix: `raw = cfg.get("max_comments"); raw = default if raw is None else str(raw)`
+   then validate.
+
+9. **Two-dot diff vs merge-base drift** (lines ~337, 345 — PRE-EXISTING in v1,
+   re-exposed by rewrite). `git diff base.sha..head.sha` uses the base ref tip;
+   pr-patches.json (pulls/files API) uses merge-base semantics. When base has
+   advanced, per-file diffs include reverse base-branch changes absent from the
+   API patches → categorizer mislabels, subagents review lines not in the PR,
+   post-inline 422s.
+   Fix: diff against `$(git merge-base BASE_SHA HEAD_SHA)` (three-dot semantics).
+
+10. **Unbounded review-context.md** (line ~306 — pre-existing risk, v1 forced
+    full reads too). No size cap on inlined per-file diffs + full rules files;
+    orchestrator must read it all. Large non-workflow generated files
+    (lockfiles) → context blowup / big Bedrock bill.
+    Fix: cap per-file diff bytes in the context (truncate with a pointer to the
+    on-disk .diff file) and cap total context size.
+
+Below the cut (verified, lower priority):
+- Lifecycle agent has `write: false` but its instructions say "write the text
+  to a file first" for long bodies — satisfiable via bash heredoc, but wastes
+  cheap-model turns on denied write-tool calls. Either allow write or say
+  "create the file with bash".
+- `max_turns` is dead plumbing: input → config → output → consumed nowhere
+  (pinned opencode build has no --max-turns). Drop it or wire it to a real
+  bound (e.g. `timeout` around `opencode run`).
+- Human-dismissal detection reads reply bodies truncated to 200 chars —
+  dismissals phrased after char 200 are missed (low real-world rate).
+- generated-only check runs AFTER the per-file diff split and pulls/files
+  fetch; move `generated_only(changed)` right after the name-only diff.
+- The data-file contract (file names, field lists, '/'→'__' convention) is
+  hand-duplicated in 3 prose places (both agent defs + orchestrator prompt)
+  plus the code (safe_diff_name) — consider generating it or accepting drift
+  risk consciously.
+- Refuted during review (keep as-is): replacing the perl placeholder
+  substitution with direct `${{ }}` in the agent heredocs — env-based perl is
+  deliberately safer (expression expansion can break shell/heredoc syntax;
+  env vars cannot).
+
 ## Goal
 
 Improve `.github/workflows/ai-code-review.yml` (reusable AI PR-review workflow,
