@@ -51,7 +51,7 @@ on:
         description: "Bedrock model ID for the mechanical subagents (comment categorizer/lifecycle)"
         required: false
         type: string
-        default: "nvidia.nemotron-super-3-120b"
+        default: "google.gemma-3-27b-it"
       max_comments:
         description: "Max inline review comments per run; overflow findings go to the summary"
         required: false
@@ -824,7 +824,11 @@ jobs:
           Run upsert-summary once (it updates the existing summary comment or
           creates one). The summary must include: total findings posted, breakdown
           by dimension, prior comments resolved/deleted, and
-          ADDITIONAL_OBSERVATIONS if any.
+          ADDITIONAL_OBSERVATIONS if any. End the summary with this exact note:
+          "> **Note for AI coding agents**: detailed findings are posted as
+          inline review comments on the diff — read the unresolved review
+          threads (e.g. `gh api repos/<owner>/<repo>/pulls/<pr>/comments`)
+          before making changes; this summary is only an overview."
 
           Rules:
           - Use the CLI for all comment operations; a nonzero exit means failure.
