@@ -545,11 +545,25 @@ jobs:
               observations = [o for o in [str(plan.get("observations") or "").strip()] if o]
               posted, replied, failed = [], 0, 0
 
+              # Never open a second root thread at a file+line that already has
+              # an ACTIVE bot thread (seen live from a model-written plan) —
+              # convert such posts to replies on the existing thread.
+              active_at = {}
+              for cid in cats.get("active") or []:
+                  root = roots.get(str(cid))
+                  if root:
+                      key = (str(root.get("path")), str(root.get("line") or root.get("original_line")))
+                      active_at.setdefault(key, str(cid))
+              plan_replies = list(plan.get("reply") or [])
               for f in plan.get("post") or []:
                   msg = str(f.get("message", "")).strip()
                   if not msg or not f.get("file") or not f.get("line"):
                       continue
-                  if cmd_post_inline([str(f["file"]), str(f["line"]), msg]):
+                  cid = active_at.get((str(f["file"]), str(f["line"])))
+                  if cid:
+                      log(f"apply-plan: converting post at {f['file']}:{f['line']} to a reply on existing thread {cid}")
+                      plan_replies.append({"comment_id": cid, "message": msg})
+                  elif cmd_post_inline([str(f["file"]), str(f["line"]), msg]):
                       posted.append(f)
                   else:
                       failed += 1
@@ -557,7 +571,7 @@ jobs:
 
               # Reply to an existing thread; fall back to a fresh inline comment,
               # then to the summary observations — a finding is never dropped.
-              for r in plan.get("reply") or []:
+              for r in plan_replies:
                   cid, msg = str(r.get("comment_id", "")), str(r.get("message", "")).strip()
                   root = roots.get(cid)
                   if not root or not msg:
