@@ -16,6 +16,8 @@ name: ai-code-review
 #   commented after the marker. Summary comments are deduped in a post-step too.
 # - Optional BORIS infra context: set inputs.boris_mcp_url to install the bmcp
 #   CLI (AWS SigV4 auth reuses the Bedrock OIDC role — no extra secrets).
+#   `bmcp install opencode --scope project` (bmcp >= v0.3.0) writes ./BORIS.md
+#   and an ./AGENTS.md managed block so all agents get the live tool catalog.
 #
 # AWS auth: OIDC -> configure-aws-credentials (STS session keys on the runner).
 # Pre-computed review inputs live under AI_REVIEW_DIR inside the repo worktree
@@ -84,8 +86,8 @@ jobs:
       OPENCODE_RELEASE: v1.17.13
       OPENCODE_LINUX_X64_SHA256: 157afa289d1a8d9372de0ce19ac726119b937a1f6b201808d46f06e4e59bb348
       # https://github.com/sirob-tech/boris-mcp-cli/releases — linux amd64 CLI tarball + SHA-256
-      BMCP_RELEASE: v0.2.0
-      BMCP_LINUX_AMD64_SHA256: cd32f36b932a26bee0db9c71c416ff0a8786429aa4d1dcf28d9077797053236c
+      BMCP_RELEASE: v0.3.0
+      BMCP_LINUX_AMD64_SHA256: 2c854ce54b9ce813b04d2088c771482405c7ea45392180130b9686cc962c0e6c
     permissions:
       contents: read
       pull-requests: write
@@ -658,12 +660,15 @@ jobs:
             || echo "::warning::bmcp init failed — BORIS tools will be unavailable"
           bmcp sync --non-interactive \
             || echo "::warning::bmcp sync failed — BORIS tools may be unavailable"
-          # Write BORIS usage instructions into the worktree (AGENTS.md et al,
-          # appended inside markers — existing files are never overwritten).
-          # OpenCode reads AGENTS.md at session start, so the orchestrator and
-          # subagents discover bmcp and the synced tool list on their own.
-          # Runs after sync so the embedded tool list is fresh.
-          bmcp install all --scope project \
+          # Write BORIS usage instructions into the worktree: ./BORIS.md (tool
+          # catalog + usage) plus a managed block appended in ./AGENTS.md —
+          # existing files are never overwritten. OpenCode reads AGENTS.md at
+          # session start, so the orchestrator and every subagent discover bmcp
+          # and the synced tool list on their own. The opencode harness needs
+          # bmcp >= v0.3.0. Runs after sync so the embedded tool list is fresh,
+          # and after precompute so the managed block never leaks into the
+          # assembled review rules.
+          bmcp install opencode --scope project --non-interactive \
             || echo "::warning::bmcp install failed — agents may not discover BORIS tools"
           bmcp doctor --non-interactive \
             || echo "::warning::bmcp doctor reported problems"
@@ -872,7 +877,7 @@ jobs:
           - PR file patches: .ai-review-work/pr-patches.json (inline positioning)
           - Comment data: .ai-review-work/*.json
 
-          ${{ inputs.boris_mcp_url != '' && 'Live infrastructure context: the bmcp CLI (BORIS MCP bridge) is installed and configured. Review subagents may use it READ-ONLY for live AWS and deployment context when reviewing infrastructure changes. Usage: `bmcp list` shows tools, `bmcp describe <tool>` shows a tool schema, `bmcp <tool> --arg value` calls one. Mention its availability in the brief of any subagent whose dimension involves infrastructure.' || '' }}
+          ${{ inputs.boris_mcp_url != '' && 'Live infrastructure context: the bmcp CLI (BORIS MCP bridge) is installed. Its usage instructions and live tool catalog are in ./BORIS.md, loaded into you and every subagent through the managed block in the ./AGENTS.md project rules. Review subagents may use it READ-ONLY for live AWS and deployment context when reviewing infrastructure changes. Mention its availability in the brief of any subagent whose dimension involves infrastructure.' || '' }}
 
           Execution plan — follow these steps in order:
 

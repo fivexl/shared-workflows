@@ -207,9 +207,10 @@ How it works:
   release of `sirob-tech/boris-mcp-cli`;
 - `bmcp` authenticates to the BORIS endpoint with AWS SigV4 using the same
   OIDC role the workflow already assumed — no additional secrets;
-- `bmcp install all` writes BORIS usage instructions into the runner's
-  worktree (`AGENTS.md` and friends, appended inside markers — the repo's own
-  files are never overwritten), so the agents discover the tools on their own;
+- `bmcp install opencode --scope project` writes BORIS usage instructions and
+  the synced tool catalog into the runner's worktree (`BORIS.md` plus a managed
+  block appended in `AGENTS.md` — the repo's own files are never overwritten),
+  so the agents discover the tools on their own;
 - review subagents get **read-only** access to BORIS tools (resource lookups,
   infrastructure graph queries, memory search) and are told to use them when
   the dimension involves infrastructure;
