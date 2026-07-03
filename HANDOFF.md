@@ -23,10 +23,30 @@ Implementation notes (delta vs. the plan below):
 - First real-PR run should watch: OpenCode task-tool subagent invocation by
   name, and Nemotron's reliability on the categorizer/lifecycle roles.
 
-## Code review findings (2026-07-03, multi-agent review of the v2 commit — NOT yet fixed)
+## Code review findings (2026-07-03, multi-agent review of the v2 commit — ALL FIXED)
 
-Ranked by severity. Line numbers refer to .github/workflows/ai-code-review.yml
-at commit ba15c2e. Findings 1-5 should be fixed before shipping.
+**Status update (2026-07-03, later session): findings 1-10 below are FIXED**
+on this branch (commit after 43a7834). Mechanisms chosen:
+- Finding 2/3: new `RESOLVE_MARKER = <!-- ai-review-resolve -->`, prepended by
+  `resolve-reply`; `resolve-threads` matches ONLY the marker and skips a thread
+  when any non-bot comment follows the latest marker reply. All phrase literals
+  removed from prompts.
+- Finding 6: mutation subcommands now exit nonzero on failure; lifecycle prompt
+  has fallback instructions (reply→post-inline→summary observations).
+- Finding 10: context caps PER_FILE_DIFF_CAP=20k / TOTAL_DIFF_CAP=250k with
+  truncation pointers to the on-disk .diff files.
+- Below-the-cut items also done: lifecycle prompt says "bash heredoc" for long
+  bodies; `max_turns` dropped entirely (input, config, docs, template);
+  reply-body truncation raised to 400 chars; generated-only check moved before
+  the per-file diff split and pulls/files fetch. NOT done (conscious): the
+  data-file contract stays hand-duplicated in prose; perl substitution kept.
+- Validation: YAML parses (all 3 files); embedded Python extracted +
+  byte-compiled; 29 functional checks pass (config sanitization incl. scalar
+  dims and max_comments:0, resolve-threads marker/human-dispute/null-author
+  matrix, null-user precompute, context truncation, exit codes).
+
+Original findings (line numbers refer to commit ba15c2e), kept for reference.
+Ranked by severity. Findings 1-5 should be fixed before shipping.
 
 1. **NO_ISSUES deletes unrelated bot comments** (line ~661, categorizer def +
    lifecycle Step 4). The categorizer classifies EVERY bot top-level comment

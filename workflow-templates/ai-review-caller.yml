@@ -35,7 +35,7 @@ jobs:
     #   boris_mcp_url: https://boris.example.com/mcp    # enable BORIS infra context via bmcp (org-controlled)
     #
     # Per-repo tuning also works via .github/ai-review.yml on the repo itself:
-    #   model, max_turns, max_comments, additional_dimensions (values are sanitized).
+    #   model, max_comments, additional_dimensions (values are sanitized).
     secrets:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}

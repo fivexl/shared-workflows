@@ -11,8 +11,9 @@ name: ai-code-review
 # - Mechanical subagents (comment-categorizer, comment-lifecycle) run on a
 #   cheap model (inputs.subagent_model); review subagents run on the main model.
 # - Review threads are resolved deterministically in a post-step: the agent
-#   only posts a "Resolved ..." reply, then the workflow resolves matching
-#   threads via GraphQL. Summary comments are deduped in a post-step too.
+#   posts a resolve-reply (the CLI tags it with a hidden HTML marker), then the
+#   workflow resolves marker-tagged threads via GraphQL — unless a human
+#   commented after the marker. Summary comments are deduped in a post-step too.
 # - Optional BORIS infra context: set inputs.boris_mcp_url to install the bmcp
 #   CLI (AWS SigV4 auth reuses the Bedrock OIDC role — no extra secrets).
 #
@@ -28,7 +29,7 @@ name: ai-code-review
 # Called by per-repo caller workflows via workflow_call.
 #
 # Per-repo config (.github/ai-review.yml, read from the PR branch, values
-# sanitized against prompt injection): model, max_turns, max_comments,
+# sanitized against prompt injection): model, max_comments,
 # additional_dimensions.
 
 on:
@@ -49,11 +50,6 @@ on:
         required: false
         type: string
         default: "nvidia.nemotron-super-3-120b"
-      max_turns:
-        description: "Max agent turns (informational; this opencode build has no --max-turns on run)"
-        required: false
-        type: string
-        default: "20"
       max_comments:
         description: "Max inline review comments per run; overflow findings go to the summary"
         required: false
@@ -147,8 +143,14 @@ jobs:
           APP_SLUG = os.environ.get("APP_SLUG", "")
 
           SUMMARY_MARKER = "<!-- ai-review-summary -->"
-          RESOLVED_RE = re.compile(r"(?i)(resolved|no longer part of the diff|issue appears resolved)")
+          # resolve-reply prepends this to its reply; resolve-threads and the
+          # lifecycle agent match ONLY this marker (never free-text phrases).
+          RESOLVE_MARKER = "<!-- ai-review-resolve -->"
           GENERATED_MARKER = "automatically generated from:"
+          # Caps keep review-context.md a single orchestrator-readable file; the
+          # full per-file diffs stay on disk under pr-diffs/ for subagents.
+          PER_FILE_DIFF_CAP = 20_000
+          TOTAL_DIFF_CAP = 250_000
 
 
           def log(msg):
@@ -212,7 +214,10 @@ jobs:
               if arg == "-":
                   return sys.stdin.read()
               if arg.startswith("@"):
-                  return Path(arg[1:]).read_text()
+                  try:
+                      return Path(arg[1:]).read_text()
+                  except OSError:
+                      return arg  # literal body that happens to start with '@' (e.g. an @mention)
               return arg
 
 
@@ -222,7 +227,6 @@ jobs:
 
           def cmd_config(_args):
               model = os.environ.get("DEFAULT_MODEL", "")
-              max_turns = os.environ.get("DEFAULT_MAX_TURNS", "20")
               max_comments = os.environ.get("DEFAULT_MAX_COMMENTS", "10")
               dims = []
 
@@ -246,19 +250,21 @@ jobs:
               else:
                   warn(f"Invalid model {raw_model!r}, using default {model!r}")
 
-              raw = str(cfg.get("max_turns") or max_turns)
-              if raw.isdigit():
-                  max_turns = raw
-              else:
-                  warn(f"Invalid max_turns {raw!r}, using default {max_turns!r}")
-
-              raw = str(cfg.get("max_comments") or max_comments)
+              # `or default` would swallow a configured 0 — distinguish None (absent).
+              raw = cfg.get("max_comments")
+              raw = max_comments if raw is None else str(raw)
               if raw.isdigit():
                   max_comments = raw
               else:
                   warn(f"Invalid max_comments {raw!r}, using default {max_comments!r}")
 
-              for dim in cfg.get("additional_dimensions") or []:
+              raw_dims = cfg.get("additional_dimensions")
+              if raw_dims is None:
+                  raw_dims = []
+              elif not isinstance(raw_dims, list):
+                  # A scalar (`additional_dimensions: iac`) must not be iterated char by char.
+                  raw_dims = [raw_dims]
+              for dim in raw_dims:
                   dim = str(dim)
                   if re.fullmatch(r"[A-Za-z0-9_-]+", dim):
                       dims.append(dim)
@@ -266,14 +272,13 @@ jobs:
                       warn(f"Invalid additional_dimension {dim!r}, skipping")
 
               gh_output("model", model)
-              gh_output("max_turns", max_turns)
               gh_output("max_comments", max_comments)
               gh_output("additional_dimensions", ",".join(dims))
-              log(f"model={model} max_turns={max_turns} max_comments={max_comments} "
+              log(f"model={model} max_comments={max_comments} "
                   f"additional_dimensions={dims or '(none)'}")
 
 
-          def generated_only(changed):
+          def generated_only(changed, merge_base):
               if not changed:
                   return False
               for path in changed:
@@ -282,7 +287,7 @@ jobs:
                   if Path(path).is_file():
                       content = Path(path).read_text(errors="replace")
                   else:
-                      content = run(["git", "show", f"{BASE_SHA}:{path}"], check=False).stdout
+                      content = run(["git", "show", f"{merge_base}:{path}"], check=False).stdout
                   head = "".join(content.splitlines(keepends=True)[:5])
                   if GENERATED_MARKER not in head:
                       return False
@@ -305,11 +310,16 @@ jobs:
 
           def assemble_context(changed, roots, replies, rules, dims):
               parts = ["# Changed Files\n```\n" + "\n".join(changed) + "\n```\n", "# Per-File Diffs\n"]
+              budget = TOTAL_DIFF_CAP
               for path in changed:
                   diff_file = WORK_DIR / "pr-diffs" / f"{safe_diff_name(path)}.diff"
                   diff = diff_file.read_text(errors="replace") if diff_file.is_file() else ""
                   if not diff.strip():
                       continue
+                  cap = min(PER_FILE_DIFF_CAP, max(budget, 0))
+                  if len(diff) > cap:
+                      diff = diff[:cap] + f"\n... [truncated — read the full diff from {diff_file}]"
+                  budget -= len(diff)
                   parts.append(f"## {path}\n```diff\n{diff}\n```\n")
               parts.append("# Existing Bot Review Comments\n```json\n" + json.dumps(roots, indent=1) + "\n```\n")
               parts.append("# Thread Replies (bot and human)\n```json\n" + json.dumps(replies, indent=1) + "\n```\n")
@@ -332,17 +342,27 @@ jobs:
               diff_dir = WORK_DIR / "pr-diffs"
               diff_dir.mkdir(exist_ok=True)
 
+              # Diff from the merge base (three-dot semantics), matching the
+              # pulls/files API patches; diffing against the base tip would pull
+              # in reverse base-branch changes whenever base has advanced.
+              merge_base = run(["git", "merge-base", BASE_SHA, HEAD_SHA]).stdout.strip()
               changed = [
                   line
-                  for line in run(["git", "diff", "--name-only", f"{BASE_SHA}..{HEAD_SHA}"]).stdout.splitlines()
+                  for line in run(["git", "diff", "--name-only", f"{merge_base}..{HEAD_SHA}"]).stdout.splitlines()
                   if line
               ]
               (WORK_DIR / "changed-files.txt").write_text("\n".join(changed) + ("\n" if changed else ""))
               log("Changed files:\n" + ("\n".join(changed) or "(none)"))
 
+              if generated_only(changed, merge_base):
+                  notice("All changed files are generated — skipping AI review.")
+                  gh_output("skip_review", "true")
+                  return
+              gh_output("skip_review", "false")
+
               # Per-file diffs keep each chunk under subagent read limits.
               for path in changed:
-                  diff = run(["git", "diff", f"{BASE_SHA}..{HEAD_SHA}", "--", path]).stdout
+                  diff = run(["git", "diff", f"{merge_base}..{HEAD_SHA}", "--", path]).stdout
                   (diff_dir / f"{safe_diff_name(path)}.diff").write_text(diff)
               log(f"Split diff into {len(changed)} per-file chunks")
 
@@ -353,32 +373,28 @@ jobs:
               ]
               (WORK_DIR / "pr-patches.json").write_text(json.dumps(patches, indent=1))
 
-              if generated_only(changed):
-                  notice("All changed files are generated — skipping AI review.")
-                  gh_output("skip_review", "true")
-                  return
-              gh_output("skip_review", "false")
-
+              # "user" can be JSON null (deleted/ghost accounts) — never .get() on it directly.
               login = bot_login()
               review_comments = gh_api_paginated(f"repos/{REPO}/pulls/{PR_NUMBER}/comments")
               roots = [
                   {"id": c["id"], "path": c.get("path"), "line": c.get("line"),
                    "original_line": c.get("original_line"), "body": str(c.get("body", ""))[:200]}
                   for c in review_comments
-                  if c.get("user", {}).get("login") == login and c.get("in_reply_to_id") is None
+                  if (c.get("user") or {}).get("login") == login and c.get("in_reply_to_id") is None
               ]
               # Keep ALL replies (bot + human) so the review honors human
-              # feedback like "false positive" / "won't fix".
+              # feedback like "false positive" / "won't fix". 400 chars keeps
+              # room for dismissals phrased later in the reply.
               replies = [
                   {"id": c["id"], "in_reply_to_id": c["in_reply_to_id"],
-                   "author": c.get("user", {}).get("login"), "body": str(c.get("body", ""))[:200]}
+                   "author": (c.get("user") or {}).get("login"), "body": str(c.get("body", ""))[:400]}
                   for c in review_comments
                   if c.get("in_reply_to_id") is not None
               ]
               issue_comments = [
                   {"id": c["id"], "body": str(c.get("body", ""))}
                   for c in gh_api_paginated(f"repos/{REPO}/issues/{PR_NUMBER}/comments")
-                  if c.get("user", {}).get("login") == login
+                  if (c.get("user") or {}).get("login") == login
               ]
               (WORK_DIR / "bot-review-comments.json").write_text(json.dumps(roots, indent=1))
               (WORK_DIR / "thread-reply-comments.json").write_text(json.dumps(replies, indent=1))
@@ -397,9 +413,11 @@ jobs:
               assemble_context(changed, roots, replies, rules, os.environ.get("ADDITIONAL_DIMENSIONS", ""))
 
 
+          # Mutation commands return False on failure; main() turns that into a
+          # nonzero exit so the calling agent can detect it and fall back.
           def cmd_post_inline(args):
               path, line, body = args[0], args[1], read_body(args[2])
-              gh_mutate(
+              return gh_mutate(
                   [f"repos/{REPO}/pulls/{PR_NUMBER}/comments",
                    "-f", f"body={body}", "-f", f"commit_id={HEAD_SHA}",
                    "-f", f"path={path}", "-F", f"line={line}", "-f", "side=RIGHT"],
@@ -409,7 +427,7 @@ jobs:
 
           def cmd_reply(args):
               comment_id, body = args[0], read_body(args[1])
-              gh_mutate(
+              return gh_mutate(
                   [f"repos/{REPO}/pulls/{PR_NUMBER}/comments",
                    "-f", f"body={body}", "-F", f"in_reply_to={comment_id}"],
                   f"Failed to reply to comment {comment_id}",
@@ -418,7 +436,9 @@ jobs:
 
           def cmd_resolve_reply(args):
               message = args[1] if len(args) > 1 else "Resolved — this line is no longer part of the diff."
-              cmd_reply([args[0], message])
+              # The marker is the ONLY thing resolve-threads matches on, and it
+              # is prepended so the 400-char reply truncation cannot drop it.
+              return cmd_reply([args[0], f"{RESOLVE_MARKER}\n{message}"])
 
 
           def cmd_upsert_summary(args):
@@ -432,18 +452,20 @@ jobs:
                                 "-f", f"body={body}"],
                                f"Failed to update summary comment {summary_id}"):
                       log(f"Updated summary comment {summary_id}")
-                      return
+                      return True
               if gh_mutate([f"repos/{REPO}/issues/{PR_NUMBER}/comments", "-f", f"body={body}"],
                            "Failed to create summary comment"):
                   log("Created new summary comment")
+                  return True
+              return False
 
 
           def cmd_delete_comment(args):
               comment_id = args[0]
               kind = args[1] if len(args) > 1 else "issue"
               endpoint = "pulls/comments" if kind == "review" else "issues/comments"
-              gh_mutate(["-X", "DELETE", f"repos/{REPO}/{endpoint}/{comment_id}"],
-                        f"Failed to delete {kind} comment {comment_id}")
+              return gh_mutate(["-X", "DELETE", f"repos/{REPO}/{endpoint}/{comment_id}"],
+                               f"Failed to delete {kind} comment {comment_id}")
 
 
           THREADS_QUERY = """
@@ -495,12 +517,17 @@ jobs:
                       continue
                   if (comments[0].get("author") or {}).get("login") != APP_SLUG:
                       continue
-                  has_resolution_reply = any(
-                      (c.get("author") or {}).get("login") == APP_SLUG
-                      and RESOLVED_RE.search(c.get("body") or "")
-                      for c in comments[1:]
-                  )
-                  if not has_resolution_reply:
+                  marker_idx = None
+                  for i, c in enumerate(comments[1:], start=1):
+                      if ((c.get("author") or {}).get("login") == APP_SLUG
+                              and RESOLVE_MARKER in (c.get("body") or "")):
+                          marker_idx = i
+                  if marker_idx is None:
+                      continue
+                  # A non-bot comment after the latest resolve marker means a
+                  # human is disputing (likely un-resolved the thread) — leave it.
+                  if any((c.get("author") or {}).get("login") != APP_SLUG
+                         for c in comments[marker_idx + 1:]):
                       continue
                   mut = run(["gh", "api", "graphql",
                              "-f", f"query={RESOLVE_MUTATION}", "-f", f"threadId={node['id']}"],
@@ -518,7 +545,7 @@ jobs:
               summaries = sorted(
                   c["id"]
                   for c in gh_api_paginated(f"repos/{REPO}/issues/{PR_NUMBER}/comments")
-                  if c.get("user", {}).get("login") == login and SUMMARY_MARKER in str(c.get("body", ""))
+                  if (c.get("user") or {}).get("login") == login and SUMMARY_MARKER in str(c.get("body", ""))
               )
               if len(summaries) <= 1:
                   log(f"Summary comment count: {len(summaries)} — no duplicates to clean up")
@@ -548,11 +575,13 @@ jobs:
                   print(f"Usage: ai_review.py <{'|'.join(COMMANDS)}> [args...]", file=sys.stderr)
                   return 2
               try:
-                  COMMANDS[sys.argv[1]](sys.argv[2:])
+                  ok = COMMANDS[sys.argv[1]](sys.argv[2:])
               except subprocess.CalledProcessError as exc:
                   print(f"::error::{exc.cmd} failed: {(exc.stderr or '').strip()[:500]}", file=sys.stderr)
                   return 1
-              return 0
+              # A mutation command that failed (gh_mutate already warned) exits
+              # nonzero so the calling agent can fall back.
+              return 1 if ok is False else 0
 
 
           if __name__ == "__main__":
@@ -565,7 +594,6 @@ jobs:
         id: ai-config
         env:
           DEFAULT_MODEL: ${{ inputs.model }}
-          DEFAULT_MAX_TURNS: ${{ inputs.max_turns }}
           DEFAULT_MAX_COMMENTS: ${{ inputs.max_comments }}
         run: python3 "${AI_REVIEW_DIR}/bin/ai_review.py" config
 
@@ -657,8 +685,13 @@ jobs:
           - STALE: file not in diff, or line outside changed hunks.
 
           For each top-level issue comment:
-          - SUMMARY: body contains `<!-- ai-review-summary -->`
-          - NO_ISSUES: does not contain the marker.
+          - SUMMARY: body contains `<!-- ai-review-summary -->`.
+          - NO_ISSUES: body lacks that marker AND reads as a standalone "no
+            issues found" / "LGTM"-style verdict from a previous review run.
+          - Anything else (deploy previews, coverage reports, any other
+            automation sharing this bot identity): put its id in NO array —
+            comments listed under no_issues get deleted, everything omitted
+            is left untouched.
 
           Write results to .ai-review-work/comment-categories.json as:
           {"active": [<comment ids>], "stale": [<comment ids>], "summary": [<comment ids>], "no_issues": [<comment ids>]}
@@ -691,7 +724,7 @@ jobs:
           - .ai-review-work/bot-review-comments.json — existing bot inline comments
             (root only; fields: id, path, line, original_line, body truncated to 200 chars)
           - .ai-review-work/thread-reply-comments.json — ALL thread replies (bot +
-            human); fields: id, in_reply_to_id, author, body (truncated to 200 chars)
+            human); fields: id, in_reply_to_id, author, body (truncated to 400 chars)
           - .ai-review-work/bot-issue-comments.json — bot top-level comments (id, body)
           - .ai-review-work/summary-comment-id.txt — existing summary comment ID (or empty)
 
@@ -702,18 +735,21 @@ jobs:
           - python3 .ai-review-work/bin/ai_review.py upsert-summary <body>
           - python3 .ai-review-work/bin/ai_review.py delete-comment <comment_id> [issue|review]
           A <body> argument can be literal text, @<path> to read from a file, or
-          "-" to read from stdin. For long or multi-line bodies, write the text to
-          a file under .ai-review-work/ first and pass @<path>.
+          "-" to read from stdin. For long or multi-line bodies, create a file
+          under .ai-review-work/ with a bash heredoc (the write tool is disabled
+          for you) and pass @<path>.
+          A nonzero exit means the operation failed (the CLI prints a warning
+          with details).
 
           Execute these steps IN ORDER:
 
           ## Step 1 — Handle STALE comments
           For each id in COMMENT_CATEGORIES.stale, check thread-reply-comments.json
           for an existing bot reply (author is the bot) on that thread containing
-          "Resolved" or "no longer part of the diff". If found, SKIP.
+          the marker `<!-- ai-review-resolve -->`. If found, SKIP.
           Otherwise run: resolve-reply <comment_id>
-          (The reply text marks the thread for resolution; the workflow resolves
-          marked threads in a later step.)
+          (resolve-reply tags its reply with that marker; the workflow resolves
+          marker-tagged threads in a later step.)
 
           ## Step 2 — Post new findings, matching against ACTIVE comments
           For each id in COMMENT_CATEGORIES.active, look up its details in
@@ -727,14 +763,19 @@ jobs:
           - ACTIVE comment at same file+line, different issue: reply <comment_id> <message>
           - No existing comment: post-inline <file> <line> <message>
           Track all matched ACTIVE comments in the handled set.
+          If a reply command exits nonzero, fall back to post-inline at the same
+          file+line. If post-inline also fails, do NOT drop the finding — add it
+          to the ADDITIONAL_OBSERVATIONS you include in the summary.
 
           ## Step 3 — Resolve fixed ACTIVE comments
           For each ACTIVE comment not in the handled set whose issue is no longer
-          present in the diff, check for an existing bot "resolved" reply; if none:
+          present in the diff, check thread-reply-comments.json for an existing
+          bot reply containing `<!-- ai-review-resolve -->`; if none:
           resolve-reply <comment_id> "This issue appears resolved by recent changes."
 
           ## Step 4 — Clean up NO_ISSUES comments
           For each id in COMMENT_CATEGORIES.no_issues: delete-comment <comment_id> issue
+          Never delete a comment whose id is not listed in no_issues.
 
           ## Step 5 — Upsert the summary comment
           Run upsert-summary once (it updates the existing summary comment or
@@ -743,7 +784,7 @@ jobs:
           ADDITIONAL_OBSERVATIONS if any.
 
           Rules:
-          - Use the CLI for all comment operations; check its output for warnings.
+          - Use the CLI for all comment operations; a nonzero exit means failure.
           - All inline comments MUST target changed lines only.
           - Prefer reply-in-thread over delete to preserve human replies.
           - Do NOT re-fetch comments from the API — use only the pre-computed files.
@@ -873,7 +914,6 @@ jobs:
           comments yourself.
           PROMPT_EOF
 
-          # max_turns config is informational for operators; this opencode build has no --max-turns on `run`.
           # --title avoids the default session header "build · <model>" (this job is review, not app build).
           # Run without exec so the shell remains the step process and opencode's exit code is the step outcome.
           opencode run \
