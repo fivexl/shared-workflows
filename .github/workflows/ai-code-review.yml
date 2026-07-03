@@ -1,56 +1,74 @@
 name: ai-code-review
 
 # Shared reusable workflow for AI-powered PR code review.
-# Uses OpenCode (opencode CLI) with Amazon Bedrock. The orchestrator agent reads
-# the diff and decides which review dimensions are appropriate, spawning subagents
-# in parallel as needed.
-# AWS auth: OIDC → configure-aws-credentials (STS session keys on the runner).
-# Precomputed review inputs live under AI_REVIEW_DIR inside the repo worktree so
-# OpenCode can read them (paths under /tmp are treated as external_directory and
-# are auto-rejected in non-interactive runs).
+# Uses OpenCode (opencode CLI) with Amazon Bedrock. An orchestrator agent reads
+# the pre-assembled review context, picks 2-3 review dimensions, spawns review
+# subagents in parallel, then writes a comment plan that the embedded CLI
+# applies deterministically (apply-plan: post/reply/resolve/cleanup/summary).
+#
+# Structure (v2):
+# - All deterministic logic lives in one embedded Python CLI (stdlib-only,
+#   shells out to gh/yq): pre-compute, comment operations incl. apply-plan,
+#   and post-steps. Judgment stays with agents; execution is code.
+# - One mechanical subagent (comment-categorizer) runs on a cheap model
+#   (inputs.subagent_model); review subagents run on the main model.
+# - Review threads are resolved deterministically in a post-step: the agent
+#   posts a resolve-reply (the CLI tags it with a hidden HTML marker), then the
+#   workflow resolves marker-tagged threads via GraphQL — unless a human
+#   commented after the marker. Summary comments are deduped in a post-step too.
+# - Optional BORIS infra context: set inputs.boris_mcp_url to install the bmcp
+#   CLI (AWS SigV4 auth reuses the Bedrock OIDC role — no extra secrets).
+#   `bmcp install opencode --scope project` (bmcp >= v0.3.0) writes ./BORIS.md
+#   and an ./AGENTS.md managed block so all agents get the live tool catalog.
+#
+# AWS auth: OIDC -> configure-aws-credentials (STS session keys on the runner).
+# Pre-computed review inputs live under AI_REVIEW_DIR inside the repo worktree
+# so OpenCode can read them (paths under /tmp are treated as external_directory
+# and are auto-rejected in non-interactive runs).
 #
 # OpenCode CLI: install from anomalyco/opencode GitHub Release assets (not curl|bash).
 # Bump OPENCODE_RELEASE and OPENCODE_LINUX_X64_SHA256 together when upgrading.
+# bmcp CLI: install from sirob-tech/boris-mcp-cli GitHub Release assets.
+# Bump BMCP_RELEASE and BMCP_LINUX_AMD64_SHA256 together when upgrading.
 # Called by per-repo caller workflows via workflow_call.
+#
+# Per-repo config (.github/ai-review.yml, read from the PR branch, values
+# sanitized against prompt injection): model, max_comments,
+# additional_dimensions.
 
 on:
   workflow_call:
     inputs:
-      review_plugin:
-        description: "Optional plugin name for language-specific or team-specific review rules"
-        required: false
-        type: string
-        default: ""
-      plugin_marketplace_repo:
-        description: "GitHub repo (org/name) hosting the plugin marketplace. Required when review_plugin is set."
-        required: false
-        type: string
-        default: ""
       aws_region:
         description: "AWS region for Bedrock"
         required: false
         type: string
         default: "us-east-1"
       model:
-        description: "Bedrock model ID (OpenCode amazon-bedrock provider)"
+        description: "Bedrock model ID for the orchestrator and review subagents (OpenCode amazon-bedrock provider)"
         required: false
         type: string
         default: "zai.glm-5"
-      max_turns:
-        description: "Max agent turns"
+      subagent_model:
+        description: "Bedrock model ID for the mechanical comment-categorizer subagent"
         required: false
         type: string
-        default: "20"
+        default: "nvidia.nemotron-super-3-120b"
+      max_comments:
+        description: "Max inline review comments per run; overflow findings go to the summary"
+        required: false
+        type: string
+        default: "10"
       show_full_output:
         description: "Show verbose OpenCode logs in workflow logs"
         required: false
         type: string
         default: "false"
-      approve_when_clean:
-        description: "If true, run gh pr review --approve when GraphQL shows no unresolved review threads involving this GitHub App bot"
+      boris_mcp_url:
+        description: "BORIS MCP URL. When set, the bmcp CLI is installed and review subagents may query live AWS/infra context (read-only). Org-controlled: set it in the caller workflow, never from repo config."
         required: false
         type: string
-        default: "true"
+        default: ""
     secrets:
       APP_ID:
         required: true
@@ -63,12 +81,15 @@ jobs:
   code-review:
     name: opencode-code-review
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       AI_REVIEW_DIR: .ai-review-work
       # https://github.com/anomalyco/opencode/releases — linux x64 CLI tarball + SHA-256
-      OPENCODE_RELEASE: v1.3.15
-      OPENCODE_LINUX_X64_SHA256: ee9971caebdc1dab1a3f60349f2306875e97a7ddf713628cf89b82c28280e971
+      OPENCODE_RELEASE: v1.17.13
+      OPENCODE_LINUX_X64_SHA256: 157afa289d1a8d9372de0ce19ac726119b937a1f6b201808d46f06e4e59bb348
+      # https://github.com/sirob-tech/boris-mcp-cli/releases — linux amd64 CLI tarball + SHA-256
+      BMCP_RELEASE: v0.3.0
+      BMCP_LINUX_AMD64_SHA256: 2c854ce54b9ce813b04d2088c771482405c7ea45392180130b9686cc962c0e6c
     permissions:
       contents: read
       pull-requests: write
@@ -91,146 +112,690 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
 
-      - name: Configure git identity
-        run: |
-          git config user.name "FivexL AI Code Review"
-          git config user.email "ai-code-review@users.noreply.github.com"
-
-      - name: Configure git for private plugin marketplace
-        if: inputs.review_plugin != '' && inputs.plugin_marketplace_repo != ''
-        env:
-          TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          git config --global url."https://x-access-token:${TOKEN}@github.com".insteadOf "https://github.com"
-
       - name: Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0 https://github.com/aws-actions/configure-aws-credentials
         with:
           role-to-assume: ${{ secrets.BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
 
+      - name: Write review CLI
+        run: |
+          mkdir -p "${AI_REVIEW_DIR}/bin"
+          cat > "${AI_REVIEW_DIR}/bin/ai_review.py" << 'PY_EOF'
+          #!/usr/bin/env python3
+          """Support CLI for the AI code review workflow.
+
+          All GitHub access goes through the gh CLI (authenticated via GH_TOKEN);
+          YAML config parsing shells out to yq. Stdlib only otherwise.
+
+          Env contract (set by the workflow):
+            AI_REVIEW_DIR, REPO (owner/name), PR_NUMBER, BASE_SHA, HEAD_SHA, APP_SLUG
+          """
+
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          WORK_DIR = Path(os.environ.get("AI_REVIEW_DIR", ".ai-review-work"))
+          REPO = os.environ.get("REPO", "")
+          PR_NUMBER = os.environ.get("PR_NUMBER", "")
+          BASE_SHA = os.environ.get("BASE_SHA", "")
+          HEAD_SHA = os.environ.get("HEAD_SHA", "")
+          APP_SLUG = os.environ.get("APP_SLUG", "")
+
+          SUMMARY_MARKER = "<!-- ai-review-summary -->"
+          # resolve-reply prepends this to its reply; resolve-threads and
+          # apply-plan match ONLY this marker (never free-text phrases).
+          RESOLVE_MARKER = "<!-- ai-review-resolve -->"
+          GENERATED_MARKER = "automatically generated from:"
+          # Caps keep review-context.md a single orchestrator-readable file; the
+          # full per-file diffs stay on disk under pr-diffs/ for subagents.
+          PER_FILE_DIFF_CAP = 20_000
+          TOTAL_DIFF_CAP = 250_000
+
+
+          def log(msg):
+              print(msg, flush=True)
+
+
+          def warn(msg):
+              print(f"::warning::{msg}", flush=True)
+
+
+          def notice(msg):
+              print(f"::notice::{msg}", flush=True)
+
+
+          def run(cmd, check=True):
+              return subprocess.run(cmd, text=True, capture_output=True, check=check)
+
+
+          def gh_output(name, value):
+              out = os.environ.get("GITHUB_OUTPUT")
+              if not out:
+                  log(f"(no GITHUB_OUTPUT) {name}={value}")
+                  return
+              with open(out, "a") as fh:
+                  fh.write(f"{name}={value}\n")
+
+
+          def gh_api_paginated(path):
+              # --paginate emits one JSON document per page back to back; decode
+              # them all with raw_decode instead of relying on gh --slurp.
+              res = run(["gh", "api", path, "--paginate"])
+              decoder = json.JSONDecoder()
+              text = res.stdout
+              items = []
+              idx = 0
+              while idx < len(text):
+                  while idx < len(text) and text[idx].isspace():
+                      idx += 1
+                  if idx >= len(text):
+                      break
+                  doc, idx = decoder.raw_decode(text, idx)
+                  items.extend(doc if isinstance(doc, list) else [doc])
+              return items
+
+
+          def gh_mutate(args, failure_msg):
+              res = run(["gh", "api", *args], check=False)
+              if res.returncode != 0:
+                  warn(f"{failure_msg}: {res.stderr.strip()[:300]}")
+              return res.returncode == 0
+
+
+          def bot_login():
+              if not APP_SLUG:
+                  raise SystemExit("::error::APP_SLUG env var is empty")
+              return f"{APP_SLUG}[bot]"
+
+
+          def read_body(arg):
+              # Body argument: literal text, '@<file>' to read a file, '-' for stdin.
+              if arg == "-":
+                  return sys.stdin.read()
+              if arg.startswith("@"):
+                  try:
+                      return Path(arg[1:]).read_text()
+                  except OSError:
+                      return arg  # literal body that happens to start with '@' (e.g. an @mention)
+              # Agents sometimes forget the '@' and pass a work-dir path bare; a
+              # path to an existing work file is never a legitimate comment body.
+              if re.fullmatch(r"[\w./-]+", arg):
+                  path = Path(arg)
+                  try:
+                      if path.is_file() and path.resolve().is_relative_to(WORK_DIR.resolve()):
+                          warn(f"Body argument {arg!r} is a work file — sending its contents (use @<path>)")
+                          return path.read_text()
+                  except OSError:
+                      pass
+              # Agents sometimes pass a whole multi-line body as ONE line of
+              # literal \n escapes (bash does not expand \n in quotes). Only
+              # repair the unambiguous case — many \n, zero real newlines — so
+              # a genuine mention of "\n" in a short message is left alone.
+              if "\n" not in arg and arg.count("\\n") >= 3:
+                  warn("Body contains literal \\n escapes and no newlines — unescaping (use @<path> for multi-line bodies)")
+                  return arg.replace("\\n", "\n")
+              return arg
+
+
+          def safe_diff_name(path):
+              return path.replace("/", "__")
+
+
+          def cmd_config(_args):
+              model = os.environ.get("DEFAULT_MODEL", "")
+              max_comments = os.environ.get("DEFAULT_MAX_COMMENTS", "10")
+              dims = []
+
+              cfg = {}
+              cfg_file = Path(".github/ai-review.yml")
+              if cfg_file.is_file():
+                  try:
+                      res = run(["yq", "-o=json", ".", str(cfg_file)])
+                      cfg = json.loads(res.stdout) or {}
+                  except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+                      warn(f"Failed to parse {cfg_file}, using defaults: {exc}")
+                  if not isinstance(cfg, dict):
+                      warn(f"{cfg_file} is not a mapping, using defaults")
+                      cfg = {}
+
+              # The config file comes from the PR branch: sanitize every value
+              # that reaches prompts or CLI flags to prevent injection.
+              raw_model = str(cfg.get("model") or model)
+              if re.fullmatch(r"[A-Za-z0-9._-]+", raw_model):
+                  model = raw_model
+              else:
+                  warn(f"Invalid model {raw_model!r}, using default {model!r}")
+
+              # `or default` would swallow a configured 0 — distinguish None (absent).
+              raw = cfg.get("max_comments")
+              raw = max_comments if raw is None else str(raw)
+              if raw.isdigit():
+                  max_comments = raw
+              else:
+                  warn(f"Invalid max_comments {raw!r}, using default {max_comments!r}")
+
+              raw_dims = cfg.get("additional_dimensions")
+              if raw_dims is None:
+                  raw_dims = []
+              elif not isinstance(raw_dims, list):
+                  # A scalar (`additional_dimensions: iac`) must not be iterated char by char.
+                  raw_dims = [raw_dims]
+              for dim in raw_dims:
+                  dim = str(dim)
+                  if re.fullmatch(r"[A-Za-z0-9_-]+", dim):
+                      dims.append(dim)
+                  else:
+                      warn(f"Invalid additional_dimension {dim!r}, skipping")
+
+              gh_output("model", model)
+              gh_output("max_comments", max_comments)
+              gh_output("additional_dimensions", ",".join(dims))
+              log(f"model={model} max_comments={max_comments} "
+                  f"additional_dimensions={dims or '(none)'}")
+
+
+          def generated_only(changed, merge_base):
+              if not changed:
+                  return False
+              for path in changed:
+                  if not path.startswith(".github/workflows/"):
+                      return False
+                  if Path(path).is_file():
+                      content = Path(path).read_text(errors="replace")
+                  else:
+                      content = run(["git", "show", f"{merge_base}:{path}"], check=False).stdout
+                  head = "".join(content.splitlines(keepends=True)[:5])
+                  if GENERATED_MARKER not in head:
+                      return False
+              return True
+
+
+          def discover_rules_files(changed):
+              rules = [c for c in ("AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md") if Path(c).is_file()]
+              if Path(".claude/rules").is_dir():
+                  rules.extend(str(p) for p in sorted(Path(".claude/rules").glob("*.md")))
+              for path in changed:
+                  parent = Path(path).parent
+                  while str(parent) not in (".", "/", ""):
+                      candidate = parent / "AGENTS.md"
+                      if candidate.is_file():
+                          rules.append(str(candidate))
+                      parent = parent.parent
+              return sorted(set(rules))
+
+
+          def assemble_context(changed, roots, replies, rules, dims):
+              parts = ["# Changed Files\n```\n" + "\n".join(changed) + "\n```\n", "# Per-File Diffs\n"]
+              budget = TOTAL_DIFF_CAP
+              for path in changed:
+                  diff_file = WORK_DIR / "pr-diffs" / f"{safe_diff_name(path)}.diff"
+                  diff = diff_file.read_text(errors="replace") if diff_file.is_file() else ""
+                  if not diff.strip():
+                      continue
+                  cap = min(PER_FILE_DIFF_CAP, max(budget, 0))
+                  if len(diff) > cap:
+                      diff = diff[:cap] + f"\n... [truncated — read the full diff from {diff_file}]"
+                  budget -= len(diff)
+                  parts.append(f"## {path}\n```diff\n{diff}\n```\n")
+              parts.append("# Existing Bot Review Comments\n```json\n" + json.dumps(roots, indent=1) + "\n```\n")
+              parts.append("# Thread Replies (bot and human)\n```json\n" + json.dumps(replies, indent=1) + "\n```\n")
+              summary_id = (WORK_DIR / "summary-comment-id.txt").read_text().strip()
+              parts.append("# Existing Summary Comment ID\n" + (summary_id or "(none)") + "\n")
+              parts.append("# Additional Required Dimensions\n" + (dims or "(none)") + "\n")
+              parts.append("# Review Rules\n")
+              if rules:
+                  for path in rules:
+                      parts.append(f"## {path}\n```\n{Path(path).read_text(errors='replace')}\n```\n")
+              else:
+                  parts.append("(no rules files found)\n")
+              context = "\n".join(parts)
+              (WORK_DIR / "review-context.md").write_text(context)
+              log(f"Assembled review context: {len(context)} bytes")
+
+
+          def cmd_precompute(_args):
+              WORK_DIR.mkdir(parents=True, exist_ok=True)
+              diff_dir = WORK_DIR / "pr-diffs"
+              diff_dir.mkdir(exist_ok=True)
+
+              # Diff from the merge base (three-dot semantics), matching the
+              # pulls/files API patches; diffing against the base tip would pull
+              # in reverse base-branch changes whenever base has advanced.
+              merge_base = run(["git", "merge-base", BASE_SHA, HEAD_SHA]).stdout.strip()
+              changed = [
+                  line
+                  for line in run(["git", "diff", "--name-only", f"{merge_base}..{HEAD_SHA}"]).stdout.splitlines()
+                  if line
+              ]
+              (WORK_DIR / "changed-files.txt").write_text("\n".join(changed) + ("\n" if changed else ""))
+              log("Changed files:\n" + ("\n".join(changed) or "(none)"))
+
+              if generated_only(changed, merge_base):
+                  notice("All changed files are generated — skipping AI review.")
+                  gh_output("skip_review", "true")
+                  return
+              gh_output("skip_review", "false")
+
+              # Per-file diffs keep each chunk under subagent read limits.
+              for path in changed:
+                  diff = run(["git", "diff", f"{merge_base}..{HEAD_SHA}", "--", path]).stdout
+                  (diff_dir / f"{safe_diff_name(path)}.diff").write_text(diff)
+              log(f"Split diff into {len(changed)} per-file chunks")
+
+              # Follows all pages; on very large PRs this file can grow large.
+              patches = [
+                  {"filename": f.get("filename"), "patch": f.get("patch")}
+                  for f in gh_api_paginated(f"repos/{REPO}/pulls/{PR_NUMBER}/files")
+              ]
+              (WORK_DIR / "pr-patches.json").write_text(json.dumps(patches, indent=1))
+
+              # "user" can be JSON null (deleted/ghost accounts) — never .get() on it directly.
+              login = bot_login()
+              review_comments = gh_api_paginated(f"repos/{REPO}/pulls/{PR_NUMBER}/comments")
+              roots = [
+                  {"id": c["id"], "path": c.get("path"), "line": c.get("line"),
+                   "original_line": c.get("original_line"), "body": str(c.get("body", ""))[:200]}
+                  for c in review_comments
+                  if (c.get("user") or {}).get("login") == login and c.get("in_reply_to_id") is None
+              ]
+              # Keep ALL replies (bot + human) so the review honors human
+              # feedback like "false positive" / "won't fix". 400 chars keeps
+              # room for dismissals phrased later in the reply.
+              replies = [
+                  {"id": c["id"], "in_reply_to_id": c["in_reply_to_id"],
+                   "author": (c.get("user") or {}).get("login"), "body": str(c.get("body", ""))[:400]}
+                  for c in review_comments
+                  if c.get("in_reply_to_id") is not None
+              ]
+              issue_comments = [
+                  {"id": c["id"], "body": str(c.get("body", ""))}
+                  for c in gh_api_paginated(f"repos/{REPO}/issues/{PR_NUMBER}/comments")
+                  if (c.get("user") or {}).get("login") == login
+              ]
+              (WORK_DIR / "bot-review-comments.json").write_text(json.dumps(roots, indent=1))
+              (WORK_DIR / "thread-reply-comments.json").write_text(json.dumps(replies, indent=1))
+              (WORK_DIR / "bot-issue-comments.json").write_text(json.dumps(issue_comments, indent=1))
+              log(f"Found {len(roots)} bot review comments, {len(replies)} thread replies, "
+                  f"{len(issue_comments)} bot issue comments")
+
+              summaries = sorted(c["id"] for c in issue_comments if SUMMARY_MARKER in c["body"])
+              (WORK_DIR / "summary-comment-id.txt").write_text(str(summaries[-1]) if summaries else "")
+              log(f"Existing summary comment ID: {summaries[-1] if summaries else 'none'}")
+
+              rules = discover_rules_files(changed)
+              (WORK_DIR / "review-rules-files.txt").write_text("\n".join(rules) + ("\n" if rules else ""))
+              log("Review rules files: " + (", ".join(rules) if rules else "(none)"))
+
+              assemble_context(changed, roots, replies, rules, os.environ.get("ADDITIONAL_DIMENSIONS", ""))
+
+
+          # Mutation commands return False on failure; main() turns that into a
+          # nonzero exit so the calling agent can detect it and fall back.
+          def cmd_post_inline(args):
+              path, line, body = args[0], args[1], read_body(args[2])
+              return gh_mutate(
+                  [f"repos/{REPO}/pulls/{PR_NUMBER}/comments",
+                   "-f", f"body={body}", "-f", f"commit_id={HEAD_SHA}",
+                   "-f", f"path={path}", "-F", f"line={line}", "-f", "side=RIGHT"],
+                  f"Failed to post inline comment on {path}:{line}",
+              )
+
+
+          def cmd_reply(args):
+              comment_id, body = args[0], read_body(args[1])
+              return gh_mutate(
+                  [f"repos/{REPO}/pulls/{PR_NUMBER}/comments",
+                   "-f", f"body={body}", "-F", f"in_reply_to={comment_id}"],
+                  f"Failed to reply to comment {comment_id}",
+              )
+
+
+          def cmd_resolve_reply(args):
+              message = args[1] if len(args) > 1 else "Resolved — this line is no longer part of the diff."
+              # The marker is the ONLY thing resolve-threads matches on, and it
+              # is prepended so the 400-char reply truncation cannot drop it.
+              return cmd_reply([args[0], f"{RESOLVE_MARKER}\n{message}"])
+
+
+          def cmd_upsert_summary(args):
+              body = read_body(args[0])
+              if not body.startswith(SUMMARY_MARKER):
+                  body = SUMMARY_MARKER + "\n" + body
+              summary_file = WORK_DIR / "summary-comment-id.txt"
+              summary_id = summary_file.read_text().strip() if summary_file.is_file() else ""
+              if summary_id:
+                  res = run(["gh", "api", "-X", "PATCH",
+                             f"repos/{REPO}/issues/comments/{summary_id}",
+                             "-f", f"body={body}"], check=False)
+                  if res.returncode == 0:
+                      log(f"Updated summary comment {summary_id}")
+                      return True
+                  err = (res.stderr or "").strip()
+                  warn(f"Failed to update summary comment {summary_id}: {err[:300]}")
+                  # Only fall through to creation when the comment is actually
+                  # gone (deleted); a transient failure must not duplicate the
+                  # summary.
+                  if "HTTP 404" not in err:
+                      return False
+                  log("Existing summary comment is gone — creating a new one")
+              if gh_mutate([f"repos/{REPO}/issues/{PR_NUMBER}/comments", "-f", f"body={body}"],
+                           "Failed to create summary comment"):
+                  log("Created new summary comment")
+                  return True
+              return False
+
+
+          def cmd_delete_comment(args):
+              comment_id = args[0]
+              kind = args[1] if len(args) > 1 else "issue"
+              endpoint = "pulls/comments" if kind == "review" else "issues/comments"
+              return gh_mutate(["-X", "DELETE", f"repos/{REPO}/{endpoint}/{comment_id}"],
+                               f"Failed to delete {kind} comment {comment_id}")
+
+
+          AGENT_NOTE = (
+              "> **Note for AI coding agents**: detailed findings are posted as "
+              "inline review comments on the diff — read the unresolved review "
+              "threads (e.g. `gh api repos/<owner>/<repo>/pulls/<pr>/comments`) "
+              "before making changes; this summary is only an overview."
+          )
+
+
+          def _load_json(name, default):
+              try:
+                  return json.loads((WORK_DIR / name).read_text())
+              except (OSError, json.JSONDecodeError):
+                  return default
+
+
+          def cmd_apply_plan(args):
+              """Deterministically execute the orchestrator's comment plan.
+
+              Plan (JSON object): {
+                "post":    [{"file","line","message","dimension","severity"}],
+                "reply":   [{"comment_id","message"}],
+                "resolve": [<ids of ACTIVE bot comments judged fixed>],
+                "observations": "<text that goes to the summary only>"
+              }
+              Only the plan requires judgment; stale-thread resolution and
+              no_issues cleanup are driven straight from the categorizer output,
+              and the summary is rendered from a fixed template.
+              """
+              try:
+                  plan = json.loads(read_body(args[0]))
+              except (IndexError, json.JSONDecodeError) as exc:
+                  print(f"::error::apply-plan: invalid plan JSON: {exc}", file=sys.stderr)
+                  return False
+              cats = _load_json("comment-categories.json", {})
+              roots = {str(c["id"]): c for c in _load_json("bot-review-comments.json", [])}
+
+              # Threads that already carry a bot resolve-marker reply.
+              bot = bot_login()
+              marked = {str(r.get("in_reply_to_id"))
+                        for r in _load_json("thread-reply-comments.json", [])
+                        if r.get("author") == bot and RESOLVE_MARKER in str(r.get("body", ""))}
+
+              observations = [o for o in [str(plan.get("observations") or "").strip()] if o]
+              posted, replied, failed = [], 0, 0
+
+              # Never open a second root thread at a file+line that already has
+              # an ACTIVE bot thread (seen live from a model-written plan) —
+              # convert such posts to replies on the existing thread.
+              active_at = {}
+              for cid in cats.get("active") or []:
+                  root = roots.get(str(cid))
+                  if root:
+                      key = (str(root.get("path")), str(root.get("line") or root.get("original_line")))
+                      active_at.setdefault(key, str(cid))
+              plan_replies = list(plan.get("reply") or [])
+              for f in plan.get("post") or []:
+                  msg = str(f.get("message", "")).strip()
+                  if not msg or not f.get("file") or not f.get("line"):
+                      continue
+                  cid = active_at.get((str(f["file"]), str(f["line"])))
+                  if cid:
+                      log(f"apply-plan: converting post at {f['file']}:{f['line']} to a reply on existing thread {cid}")
+                      plan_replies.append({"comment_id": cid, "message": msg})
+                  elif cmd_post_inline([str(f["file"]), str(f["line"]), msg]):
+                      posted.append(f)
+                  else:
+                      failed += 1
+                      observations.append(f"{f['file']}:{f['line']} — {msg}")
+
+              # Reply to an existing thread; fall back to a fresh inline comment,
+              # then to the summary observations — a finding is never dropped.
+              for r in plan_replies:
+                  cid, msg = str(r.get("comment_id", "")), str(r.get("message", "")).strip()
+                  root = roots.get(cid)
+                  if not root or not msg:
+                      continue
+                  if cmd_reply([cid, msg]):
+                      replied += 1
+                      continue
+                  line = root.get("line") or root.get("original_line")
+                  if root.get("path") and line and cmd_post_inline([str(root["path"]), str(line), msg]):
+                      posted.append({"file": root["path"], "line": line, "message": msg,
+                                     "dimension": "general"})
+                  else:
+                      failed += 1
+                      observations.append(f"{root.get('path')}:{line} — {msg}")
+
+              # Resolve-replies: stale threads need no judgment; "fixed" ids come
+              # from the plan but only known bot roots count, and threads already
+              # carrying a marker are never re-replied. Actual resolution stays
+              # in the resolve-threads post-step (which honors human disputes).
+              fixed = {str(i) for i in (plan.get("resolve") or []) if str(i) in roots}
+              stale = {str(i) for i in (cats.get("stale") or []) if str(i) in roots}
+              resolved = 0
+              for cid in sorted(fixed - stale - marked):
+                  if cmd_resolve_reply([cid, "This issue appears resolved by recent changes."]):
+                      resolved += 1
+                  else:
+                      failed += 1
+              for cid in sorted(stale - marked):
+                  if cmd_resolve_reply([cid]):
+                      resolved += 1
+                  else:
+                      failed += 1
+
+              # no_issues ids come only from the categorizer, never the plan.
+              deleted = 0
+              for cid in cats.get("no_issues") or []:
+                  if cmd_delete_comment([str(cid), "issue"]):
+                      deleted += 1
+                  else:
+                      failed += 1
+
+              by_dim = {}
+              for f in posted:
+                  dim = str(f.get("dimension") or "general")
+                  by_dim[dim] = by_dim.get(dim, 0) + 1
+              lines = [SUMMARY_MARKER, "## AI Code Review Summary", ""]
+              lines.append(f"- **Findings posted**: {len(posted)} inline, {replied} thread replies")
+              if by_dim:
+                  lines.append("- **By dimension**: " + ", ".join(f"{k}: {v}" for k, v in sorted(by_dim.items())))
+              lines.append(f"- **Threads marked resolved**: {resolved}")
+              if deleted:
+                  lines.append(f"- **Stale bot comments removed**: {deleted}")
+              if observations:
+                  lines += ["", "### Additional observations", ""] + [f"- {o}" for o in observations]
+              lines += ["", AGENT_NOTE, "",
+                        "*This summary was automatically generated by the AI code review workflow.*"]
+              ok = cmd_upsert_summary(["\n".join(lines)])
+              log(f"apply-plan: posted={len(posted)} replied={replied} resolved={resolved} "
+                  f"deleted={deleted} failed={failed}")
+              # Failed ops were demoted to observations (a handled fallback) —
+              # only a failed summary upsert makes the whole command fail.
+              return ok
+
+
+          THREADS_QUERY = """
+          query($owner: String!, $name: String!, $pr: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $pr) {
+                reviewThreads(first: 100) {
+                  nodes {
+                    id
+                    isResolved
+                    comments(first: 50) {
+                      nodes { author { login } body }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          """
+
+          RESOLVE_MUTATION = """
+          mutation($threadId: ID!) {
+            resolveReviewThread(input: { threadId: $threadId }) {
+              thread { isResolved }
+            }
+          }
+          """
+
+
+          def cmd_resolve_threads(_args):
+              # GraphQL author.login has NO "[bot]" suffix — use the app slug directly.
+              owner, name = REPO.split("/", 1)
+              res = run(["gh", "api", "graphql",
+                         "-f", f"query={THREADS_QUERY}",
+                         "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"pr={PR_NUMBER}"],
+                        check=False)
+              try:
+                  nodes = json.loads(res.stdout)["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+              except (json.JSONDecodeError, KeyError, TypeError):
+                  warn("GraphQL returned no review thread data — skipping thread resolution")
+                  return
+              if len(nodes) == 100:
+                  warn("Fetched exactly 100 review threads — threads beyond the first 100 will not be resolved")
+
+              resolved = failed = 0
+              for node in nodes:
+                  comments = (node.get("comments") or {}).get("nodes") or []
+                  if node.get("isResolved") or len(comments) < 2:
+                      continue
+                  if (comments[0].get("author") or {}).get("login") != APP_SLUG:
+                      continue
+                  marker_idx = None
+                  for i, c in enumerate(comments[1:], start=1):
+                      if ((c.get("author") or {}).get("login") == APP_SLUG
+                              and RESOLVE_MARKER in (c.get("body") or "")):
+                          marker_idx = i
+                  if marker_idx is None:
+                      continue
+                  # A non-bot comment after the latest resolve marker means a
+                  # human is disputing (likely un-resolved the thread) — leave it.
+                  if any((c.get("author") or {}).get("login") != APP_SLUG
+                         for c in comments[marker_idx + 1:]):
+                      continue
+                  mut = run(["gh", "api", "graphql",
+                             "-f", f"query={RESOLVE_MUTATION}", "-f", f"threadId={node['id']}"],
+                            check=False)
+                  if mut.returncode == 0:
+                      resolved += 1
+                  else:
+                      # gh api graphql puts GraphQL errors on stderr; "Resource not
+                      # accessible by integration" means the app lacks Contents R/W
+                      # (GitHub requires it for resolveReviewThread — see README).
+                      err = (mut.stderr or mut.stdout or "").strip()[:300]
+                      warn(f"Failed to resolve thread {node['id']}: {err}")
+                      failed += 1
+              log(f"Resolved {resolved} thread(s), {failed} failure(s)")
+
+
+          def cmd_dedupe_summaries(_args):
+              login = bot_login()
+              summaries = sorted(
+                  c["id"]
+                  for c in gh_api_paginated(f"repos/{REPO}/issues/{PR_NUMBER}/comments")
+                  if (c.get("user") or {}).get("login") == login and SUMMARY_MARKER in str(c.get("body", ""))
+              )
+              if len(summaries) <= 1:
+                  log(f"Summary comment count: {len(summaries)} — no duplicates to clean up")
+                  return
+              # Keep the NEWEST (highest id) — it has the final content from this run.
+              keep = summaries[-1]
+              log(f"Found {len(summaries)} summary comments, keeping newest ({keep})")
+              for comment_id in summaries[:-1]:
+                  cmd_delete_comment([str(comment_id), "issue"])
+
+
+          COMMANDS = {
+              "config": cmd_config,
+              "precompute": cmd_precompute,
+              "post-inline": cmd_post_inline,
+              "reply": cmd_reply,
+              "resolve-reply": cmd_resolve_reply,
+              "upsert-summary": cmd_upsert_summary,
+              "delete-comment": cmd_delete_comment,
+              "apply-plan": cmd_apply_plan,
+              "resolve-threads": cmd_resolve_threads,
+              "dedupe-summaries": cmd_dedupe_summaries,
+          }
+
+
+          def main():
+              if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+                  print(f"Usage: ai_review.py <{'|'.join(COMMANDS)}> [args...]", file=sys.stderr)
+                  return 2
+              cmd, t0 = sys.argv[1], time.monotonic()
+              try:
+                  ok = COMMANDS[cmd](sys.argv[2:])
+                  # A mutation command that failed (gh_mutate already warned)
+                  # exits nonzero so the calling agent can detect it.
+                  code = 1 if ok is False else 0
+              except subprocess.CalledProcessError as exc:
+                  print(f"::error::{exc.cmd} failed: {(exc.stderr or '').strip()[:500]}", file=sys.stderr)
+                  code = 1
+              # Timing lines accumulate in timing.log; a workflow post-step
+              # prints them so per-call time inside the agent phase is visible.
+              stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+              line = f"[timing] {stamp}Z {cmd} {time.monotonic() - t0:.1f}s exit={code}"
+              log(line)
+              try:
+                  with open(WORK_DIR / "timing.log", "a") as fh:
+                      fh.write(line + "\n")
+              except OSError:
+                  pass
+              return code
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY_EOF
+          python3 -m py_compile "${AI_REVIEW_DIR}/bin/ai_review.py"
+          echo "Review CLI written to ${AI_REVIEW_DIR}/bin/ai_review.py"
+
       - name: Read AI review config
         id: ai-config
         env:
           DEFAULT_MODEL: ${{ inputs.model }}
-          DEFAULT_MAX_TURNS: ${{ inputs.max_turns }}
-        run: |
-          CONFIG_FILE=".github/ai-review.yml"
+          DEFAULT_MAX_COMMENTS: ${{ inputs.max_comments }}
+        run: python3 "${AI_REVIEW_DIR}/bin/ai_review.py" config
 
-          if [ -f "$CONFIG_FILE" ]; then
-            MODEL=$(yq -r '.model // ""' "$CONFIG_FILE")
-            MAX_TURNS=$(yq -r '.max_turns // ""' "$CONFIG_FILE")
-          fi
-
-          echo "model=${MODEL:-$DEFAULT_MODEL}" >> "$GITHUB_OUTPUT"
-          echo "max_turns=${MAX_TURNS:-$DEFAULT_MAX_TURNS}" >> "$GITHUB_OUTPUT"
-
-      - name: Pre-compute PR diff
-        id: pr-diff
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          mkdir -p "${AI_REVIEW_DIR}"
-          git diff --name-only "${BASE_SHA}..${HEAD_SHA}" > "${AI_REVIEW_DIR}/changed-files.txt"
-          git diff "${BASE_SHA}..${HEAD_SHA}" > "${AI_REVIEW_DIR}/pr-diff.txt"
-          # Follows all pages; on very large PRs this file can grow large (same as local git diff size concerns).
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[] | {filename,patch}' > "${AI_REVIEW_DIR}/pr-patches.json"
-
-          echo "changed_files<<EOF" >> "$GITHUB_OUTPUT"
-          cat "${AI_REVIEW_DIR}/changed-files.txt" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Check for generated-only changes
-        id: generated-check
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          ALL_GENERATED="true"
-
-          if [ ! -s "${AI_REVIEW_DIR}/changed-files.txt" ]; then
-            ALL_GENERATED="false"
-          fi
-
-          while IFS= read -r file; do
-            [ -z "$file" ] && continue
-            case "$file" in
-              .github/workflows/*) ;;
-              *) ALL_GENERATED="false"; break ;;
-            esac
-            if [ -f "$file" ]; then
-              CONTENT=$(head -n 5 "$file")
-            else
-              CONTENT=$(git show "${BASE_SHA}:${file}" 2>/dev/null | head -n 5)
-            fi
-            if ! echo "$CONTENT" | grep -q "automatically generated from:"; then
-              ALL_GENERATED="false"
-              break
-            fi
-          done < "${AI_REVIEW_DIR}/changed-files.txt"
-
-          echo "skip_review=${ALL_GENERATED}" >> "$GITHUB_OUTPUT"
-          if [ "$ALL_GENERATED" = "true" ]; then
-            echo "::notice::All changed files are generated — skipping AI review."
-          fi
-
-      - name: Pre-compute existing bot comments
-        if: steps.generated-check.outputs.skip_review != 'true'
-        id: bot-comments
+      - name: Pre-compute review inputs
+        id: precompute
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-        run: |
-          set -eo pipefail
-
-          if [ -z "$APP_SLUG" ]; then
-            echo "::error::Failed to determine app slug from token step"
-            exit 1
-          fi
-
-          BOT_LOGIN="${APP_SLUG}[bot]"
-          echo "Bot login: ${BOT_LOGIN}"
-
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
-            | jq -s --arg bot "$BOT_LOGIN" '[.[][] | select(.user.login == $bot and .in_reply_to_id == null) | {id, path, line, original_line, body: (.body | tostring[0:200])}]' \
-            > "${AI_REVIEW_DIR}/bot-review-comments.json"
-
-          gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
-            | jq -s --arg bot "$BOT_LOGIN" '[.[][] | select(.user.login == $bot and .in_reply_to_id != null) | {id, in_reply_to_id, body: (.body | tostring[0:200])}]' \
-            > "${AI_REVIEW_DIR}/bot-reply-comments.json"
-
-          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            | jq -s --arg bot "$BOT_LOGIN" '[.[][] | select(.user.login == $bot) | {id, body}]' \
-            > "${AI_REVIEW_DIR}/bot-issue-comments.json"
-
-          REVIEW_COUNT=$(jq 'length' "${AI_REVIEW_DIR}/bot-review-comments.json" || echo 0)
-          REPLY_COUNT=$(jq 'length' "${AI_REVIEW_DIR}/bot-reply-comments.json" || echo 0)
-          ISSUE_COUNT=$(jq 'length' "${AI_REVIEW_DIR}/bot-issue-comments.json" || echo 0)
-          echo "Found ${REVIEW_COUNT} bot review comments, ${REPLY_COUNT} bot reply comments, ${ISSUE_COUNT} bot issue comments"
-
-      - name: Print review configuration
-        if: steps.generated-check.outputs.skip_review != 'true'
-        env:
-          MODEL: ${{ steps.ai-config.outputs.model }}
-          MAX_TURNS: ${{ steps.ai-config.outputs.max_turns }}
-          CHANGED_FILES: ${{ steps.pr-diff.outputs.changed_files }}
-        run: |
-          echo "::group::Review configuration"
-          echo "Model: ${MODEL}"
-          echo "Max turns: ${MAX_TURNS}"
-          echo "::endgroup::"
-
-          echo "::group::Changed files"
-          echo "$CHANGED_FILES"
-          echo "::endgroup::"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ADDITIONAL_DIMENSIONS: ${{ steps.ai-config.outputs.additional_dimensions }}
+        run: python3 "${AI_REVIEW_DIR}/bin/ai_review.py" precompute
 
       - name: Install OpenCode
-        if: steps.generated-check.outputs.skip_review != 'true'
+        if: steps.precompute.outputs.skip_review == 'false'
         run: |
           set -euo pipefail
           TAR="${RUNNER_TEMP}/opencode-linux-x64.tar.gz"
@@ -245,14 +810,116 @@ jobs:
           export PATH="${HOME}/.opencode/bin:${PATH}"
           test -x "${HOME}/.opencode/bin/opencode"
 
+      - name: Install bmcp (BORIS MCP CLI)
+        if: steps.precompute.outputs.skip_review == 'false' && inputs.boris_mcp_url != ''
+        env:
+          BORIS_MCP_URL: ${{ inputs.boris_mcp_url }}
+        run: |
+          set -euo pipefail
+          TAR="${RUNNER_TEMP}/bmcp-linux-amd64.tar.gz"
+          URL="https://github.com/sirob-tech/boris-mcp-cli/releases/download/${BMCP_RELEASE}/bmcp-linux-amd64.tar.gz"
+          curl -fSL "$URL" -o "$TAR"
+          # Checksum failure is fatal on purpose: never run an unverified binary.
+          echo "${BMCP_LINUX_AMD64_SHA256}  ${TAR}" | sha256sum -c -
+          echo "::notice::bmcp ${BMCP_RELEASE} linux-amd64 tarball SHA-256 verified"
+          mkdir -p "${HOME}/.bmcp/bin"
+          tar -xzf "$TAR" -C "${HOME}/.bmcp/bin"
+          chmod +x "${HOME}/.bmcp/bin/bmcp"
+          echo "${HOME}/.bmcp/bin" >> "${GITHUB_PATH}"
+          export PATH="${HOME}/.bmcp/bin:${PATH}"
+          # BORIS being unreachable must not fail the review — warn and continue;
+          # auth uses the ambient AWS credentials from the OIDC step (SigV4).
+          bmcp init --url "${BORIS_MCP_URL}" --non-interactive \
+            || echo "::warning::bmcp init failed — BORIS tools will be unavailable"
+          bmcp sync --non-interactive \
+            || echo "::warning::bmcp sync failed — BORIS tools may be unavailable"
+          # Write BORIS usage instructions into the worktree: ./BORIS.md (tool
+          # catalog + usage) plus a managed block appended in ./AGENTS.md —
+          # existing files are never overwritten. OpenCode reads AGENTS.md at
+          # session start, so the orchestrator and every subagent discover bmcp
+          # and the synced tool list on their own. The opencode harness needs
+          # bmcp >= v0.3.0. Runs after sync so the embedded tool list is fresh,
+          # and after precompute so the managed block never leaks into the
+          # assembled review rules.
+          bmcp install opencode --scope project --non-interactive \
+            || echo "::warning::bmcp install failed — agents may not discover BORIS tools"
+          bmcp doctor --non-interactive \
+            || echo "::warning::bmcp doctor reported problems"
+
+      - name: Write OpenCode agent definitions
+        if: steps.precompute.outputs.skip_review == 'false'
+        env:
+          SUBAGENT_MODEL: ${{ inputs.subagent_model }}
+        run: |
+          set -euo pipefail
+          # Defense in depth: the value lands in agent frontmatter via envsubst
+          # below. Callers are org-controlled, but validate anyway
+          # (same regex the repo-config sanitizer applies to `model`).
+          if ! [[ "${SUBAGENT_MODEL}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid subagent_model '${SUBAGENT_MODEL}'"
+            exit 1
+          fi
+          mkdir -p .opencode/agents
+
+          # Quoted heredocs keep the shell out; envsubst substitutes ONLY
+          # ${SUBAGENT_MODEL}, as literal data (never re-parsed as code).
+          cat << 'AGENT_EOF' | envsubst '${SUBAGENT_MODEL}' > .opencode/agents/comment-categorizer.md
+          ---
+          description: Categorizes existing bot review comments as ACTIVE, STALE, SUMMARY, or NO_ISSUES by comparing them against the PR diff. Use before the review to pre-compute comment state.
+          mode: subagent
+          model: amazon-bedrock/${SUBAGENT_MODEL}
+          tools:
+            edit: false
+          ---
+
+          Categorize existing bot comments by reading pre-computed data files.
+
+          Read .ai-review-work/changed-files.txt for the list of files in the diff.
+          Read per-file diffs from .ai-review-work/pr-diffs/<filename>.diff (with /
+          replaced by __) to identify changed hunks (line ranges) per file. These
+          are smaller than the full diff and avoid tool read limits.
+          Read .ai-review-work/bot-review-comments.json (root bot comments, fields:
+          id, path, line, original_line, body).
+          Read .ai-review-work/bot-issue-comments.json (top-level bot comments,
+          fields: id, body).
+
+          For each root review comment, determine:
+          - ACTIVE: its path is in the diff AND its effective line (line if
+            non-null, else original_line) falls within a changed hunk of that file.
+          - STALE: file not in diff, or line outside changed hunks.
+
+          For each top-level issue comment:
+          - SUMMARY: body contains `<!-- ai-review-summary -->`.
+          - NO_ISSUES: body lacks that marker AND reads as a standalone "no
+            issues found" / "LGTM"-style verdict from a previous review run.
+          - Anything else (deploy previews, coverage reports, any other
+            automation sharing this bot identity): put its id in NO array —
+            comments listed under no_issues get deleted, everything omitted
+            is left untouched.
+
+          Write results to .ai-review-work/comment-categories.json as:
+          {"active": [<comment ids>], "stale": [<comment ids>], "summary": [<comment ids>], "no_issues": [<comment ids>]}
+
+          If there are no existing comments, write all four arrays empty.
+          AGENT_EOF
+
+          echo "Wrote OpenCode agent definitions:"
+          ls -la .opencode/agents/
+
       - name: OpenCode PR review
         id: opencode-review
-        if: steps.generated-check.outputs.skip_review != 'true'
+        if: steps.precompute.outputs.skip_review == 'false'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           AWS_REGION: ${{ inputs.aws_region }}
           MODEL: ${{ steps.ai-config.outputs.model }}
           SHOW_FULL_OUTPUT: ${{ inputs.show_full_output }}
+          # Env contract for the review CLI, inherited by subagent bash calls.
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
@@ -266,11 +933,11 @@ jobs:
             EXTRA_LOG=(--print-logs --log-level DEBUG)
           fi
 
-          cat <<'PROMPT_EOF' > "${AI_REVIEW_DIR}/review-prompt.txt"
-          You are an orchestrator agent performing automated code review in a GitHub Actions runner.
-          The gh CLI is available and authenticated via GH_TOKEN.
-
-          ${{ inputs.review_plugin != '' && format('review_plugin input is "{0}" — OpenCode does not load Anthropic Claude marketplace plugins here; apply equivalent rules from AGENTS.md or project docs if documented.', inputs.review_plugin) || '' }}
+          cat << 'PROMPT_EOF' > "${AI_REVIEW_DIR}/review-prompt.txt"
+          You are an orchestrator agent performing automated code review in a
+          GitHub Actions runner. The gh CLI is available and authenticated via
+          GH_TOKEN, but you do not post comments yourself — you write a comment
+          plan file and the review CLI applies it deterministically.
 
           Context:
           - Repo: ${{ github.repository }}
@@ -278,119 +945,106 @@ jobs:
           - PR Head SHA: ${{ github.event.pull_request.head.sha }}
           - PR Base SHA: ${{ github.event.pull_request.base.sha }}
 
-          Pre-computed data (paths are inside the repo worktree — read these files directly; do not use /tmp):
-          - Changed file list: .ai-review-work/changed-files.txt
-          - Full diff: .ai-review-work/pr-diff.txt
-          - PR file patches (filename + patch): .ai-review-work/pr-patches.json
-          - Bot's existing inline review comments: .ai-review-work/bot-review-comments.json
-            (root-level only; fields: id, path, line, original_line, body truncated to 200 chars)
-          - Bot's existing reply comments: .ai-review-work/bot-reply-comments.json
-            (fields: id, in_reply_to_id, body truncated to 200 chars)
-          - Bot's existing top-level issue comments: .ai-review-work/bot-issue-comments.json
-            (fields: id, body)
-          You MAY use gh api for write operations (POST, PATCH, DELETE) only.
+          All pre-computed review data (changed files, per-file diffs, existing
+          bot comments, thread replies, review rules) is assembled into
+          .ai-review-work/review-context.md.
+          IMPORTANT — start by reading .ai-review-work/review-context.md.
+          Do NOT re-fetch any of this from the API.
 
-          Changed files:
-          ${{ steps.pr-diff.outputs.changed_files }}
+          Files that remain on disk for subagents (paths are inside the repo
+          worktree — do not use /tmp):
+          - Per-file diffs: .ai-review-work/pr-diffs/<filename>.diff (with /
+            replaced by __)
+          - PR file patches: .ai-review-work/pr-patches.json (inline positioning)
+          - Comment data: .ai-review-work/*.json
 
-          ## Preparation
+          ${{ inputs.boris_mcp_url != '' && 'Live infrastructure context: the bmcp CLI (BORIS MCP bridge) is installed. Its usage instructions and live tool catalog are in ./BORIS.md, loaded into you and every subagent through the managed block in the ./AGENTS.md project rules. Review subagents may use it READ-ONLY for live AWS and deployment context when reviewing infrastructure changes. Mention its availability in the brief of any subagent whose dimension involves infrastructure.' || '' }}
 
-          Before spawning subagents:
-          1. Read AGENTS.md, CLAUDE.md, .claude/CLAUDE.md, .claude/rules/, and any AGENTS.md
-             in directories touched by the PR. Repo-specific rules take precedence.
-          2. Read the diff from .ai-review-work/pr-diff.txt and patches from .ai-review-work/pr-patches.json.
-          3. Categorize existing bot comments (see Comment Lifecycle below).
+          Execution plan — follow these steps in order:
 
-          ## Review Strategy
+          Step 1 — Categorize existing comments:
+          Invoke the comment-categorizer subagent via the task tool (agent name
+          "comment-categorizer"). It writes .ai-review-work/comment-categories.json
+          with comment IDs grouped as {active, stale, summary, no_issues}.
+          Wait for it to finish, then read that file.
 
-          Based on the diff, decide how many subagents to spawn (1–4) and what each should
-          focus on. Choose only the dimensions that are relevant to the actual changes —
-          do not force dimensions that don't apply.
+          Step 2 — Spawn review subagents:
+          Using the changed files and diffs from the review context, select
+          exactly 2-3 review dimensions most relevant to the changes. Canonical
+          dimensions (adapt to the diff; substitute a more fitting dimension when
+          the changes clearly call for one, e.g. infrastructure-as-code or
+          documentation alignment):
+          - business_logic: gaps in reasoning, unhandled edge cases, race
+            conditions, state corruption, silent data loss, incorrect cascading
+            effects. Ask "what am I missing?" — surface assumptions that may not
+            hold in production.
+          - security: vulnerabilities, injection, insecure patterns, data flow
+            risks, adapted to this technology stack and architecture.
+          - performance: patterns that will not scale, waste resources, or add
+            latency, adapted to this repository's workload characteristics.
+          If the "Additional Required Dimensions" section of the review context
+          is non-empty, include those dimensions — they count toward the 2-3 total.
 
-          Example dimensions (not exhaustive — adapt to the diff):
-          - Code simplification: opportunities to reduce complexity, remove dead code,
-            consolidate duplicated logic
-          - Security: vulnerabilities, injection, insecure patterns, data flow risks
-          - Performance: scalability, resource waste, latency, inefficient patterns
-          - Documentation alignment: do docs reflect the current code? If features were
-            added, are they documented? If features were removed, is stale documentation
-            cleaned up? Are demo docs and examples updated with new scenarios?
-          - Test coverage: do new features have corresponding tests? Are removed features'
-            tests cleaned up?
-          - Best practices: does the implementation follow framework/platform conventions
-            and idiomatic patterns for the technology stack?
-          - Data integrity: schema changes, migration safety, backward compatibility
-          - API design: contract changes, breaking changes, versioning
-          - Infrastructure: misconfiguration, resource limits, IAM permissions
+          For each selected dimension write a focused review brief adapted to the
+          technology in this diff, including the relevant review rules from the
+          context (repo-specific rules take precedence over generic guidance) and
+          which per-file diffs to read. Spawn the review subagents in parallel
+          via the task tool. Each subagent should read the changed files and
+          their surrounding context (imports, callers, related modules) to
+          understand the full picture, and report findings as a list of
+          {file, line, message, dimension, severity}.
 
-          Each subagent should read the changed files and their surrounding context
-          (imports, callers, related modules) to understand the full picture.
-
-          Review principles:
-          - Focus on what matters — skip style nits, naming preferences, trivial refactors.
-          - Never suggest changing what the code does — only how it does it. All original
-            features, outputs, and behaviors must remain intact.
-          - When a change in logic appears necessary, flag it for the author to decide
+          Review principles for all subagents:
+          - Focus on what matters — skip style nits, naming preferences, trivial
+            refactors.
+          - Never suggest changing what the code does — only how it does it. All
+            original features, outputs, and behaviors must remain intact. When a
+            change in logic appears necessary, flag it for the author to decide
             rather than prescribing a fix.
-          - For documentation: if features were removed, flag stale docs for removal.
-            If features were added, flag missing documentation.
 
-          ## Comment Lifecycle Management
+          Step 3 — Collect, filter, and cap findings:
+          - Deduplicate: merge findings on the same file+line across dimensions.
+          - SEVERITY FILTER — keep only findings that would cause a bug, data
+            loss, or security issue in production; would cause a user-measurable
+            performance regression; or violate a rule explicitly stated in the
+            repo's review rules. Drop style nits and anything a senior developer
+            would approve as-is. When in doubt, drop it.
+          - Consolidate repeated patterns: if the same concern applies to 2+
+            files, keep ONE finding and list the other affected files in its
+            message.
+          - Cap at ${{ steps.ai-config.outputs.max_comments }} findings, ranked
+            by severity. Demote overflow to an "Additional observations" text
+            for the summary.
 
-          Categorize existing bot comments before spawning subagents:
-          - ACTIVE: review comment whose path is in the diff and whose effective line
-            (line if non-null, else original_line) falls within a changed hunk.
-          - STALE: review comment whose file is NOT in the diff, OR whose effective
-            line does not fall within any changed hunk.
-          - SUMMARY: top-level issue comment containing <!-- ai-review-summary -->.
-          - NO_ISSUES: top-level issue comment matching "no issues"/"LGTM" etc.
-            without the <!-- ai-review-summary --> marker.
-
-          After subagents complete, follow these steps IN ORDER:
-
-          Step A — Deduplicate: merge findings on the same file+line into one comment.
-
-          Step B — Handle STALE comments: check .ai-review-work/bot-reply-comments.json for existing
-          "Resolved" replies. If none, reply in-thread:
-          gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
-            -f body="Resolved — this line is no longer part of the diff." \
-            -F in_reply_to=<id>
-          On failure (HTTP 422), log and continue.
-
-          Step C — Match new findings against ACTIVE comments:
-          - Same file+line, similar content: SKIP.
-          - Same file+line, different issue: reply in-thread via in_reply_to.
-            On failure, fall back to a new standalone inline comment.
-          - No existing comment: post new inline comment:
-            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
-              -f body="<message>" -f commit_id="${{ github.event.pull_request.head.sha }}" \
-              -f path="<file>" -F line=<N> -f side="RIGHT"
-          Track all matched ACTIVE comments in a "handled" set.
-
-          Step D — Resolve fixed ACTIVE comments (skip "handled" set): check for existing
-          "resolved" replies. If none, reply in-thread:
-          gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
-            -f body="This issue appears resolved by recent changes." \
-            -F in_reply_to=<id>
-
-          Step E — Delete all NO_ISSUES comments:
-          gh api -X DELETE repos/${{ github.repository }}/issues/comments/{id}
-
-          Step F — Update or create summary comment:
-          Find comments with <!-- ai-review-summary --> marker. Keep lowest id, delete
-          duplicates. PATCH the survivor or create new if none exists.
-          Body MUST start with <!-- ai-review-summary --> as the very first line.
-          Include: total findings, breakdown by dimension, resolved/deleted count.
-
-          Rules:
-          - Never post a top-level comment for something that should be inline.
-          - All inline comments MUST target changed lines with correct diff positions.
-          - Prefer reply-in-thread over DELETE to preserve human replies.
-          - Check exit codes on every mutating gh api call; log errors and continue.
-          - Do NOT re-fetch comments at runtime — use only the pre-computed files.
+          Step 4 — Write the comment plan and apply it:
+          Using the existing bot comments and thread replies from the review
+          context plus .ai-review-work/comment-categories.json, build the plan:
+          - Honor human feedback: if a human replied "false positive",
+            "intended", "by design", "won't fix", or similar on a thread, do
+            NOT re-raise that issue anywhere in the plan.
+          - For each final finding from Step 3:
+            - an ACTIVE bot comment at the same file+line already raises the
+              same issue: leave it out (the thread already covers it);
+            - an ACTIVE bot comment at the same file+line raises a DIFFERENT
+              issue: add {"comment_id": <that id>, "message": ...} to "reply";
+            - otherwise add {"file", "line", "message", "dimension",
+              "severity"} to "post".
+          - "resolve": ids of ACTIVE bot comments (not yours from this run)
+            whose issue is no longer present in the current diff.
+          - "observations": the demoted/overflow findings text, or "".
+          Write the plan as ONE JSON object with real newlines (never \n
+          escapes) to .ai-review-work/comment-plan.json using a bash heredoc:
+          {"post": [...], "reply": [...], "resolve": [...], "observations": "..."}
+          Then run:
+          python3 .ai-review-work/bin/ai_review.py apply-plan @.ai-review-work/comment-plan.json
+          The CLI validates every id, falls back reply -> new inline comment ->
+          summary observations so findings are never dropped, marks stale
+          threads resolved, cleans up no_issues comments, and renders and
+          upserts the summary comment itself. Do not post, edit, delete, or
+          resolve any comments yourself, and do not write the summary. If
+          apply-plan exits nonzero, report its output in your final message.
           PROMPT_EOF
 
-          # max_turns input is informational for operators; this opencode build has no --max-turns on `run`.
           # --title avoids the default session header "build · <model>" (this job is review, not app build).
           # Run without exec so the shell remains the step process and opencode's exit code is the step outcome.
           opencode run \
@@ -399,60 +1053,31 @@ jobs:
             "${EXTRA_LOG[@]}" \
             "$(cat "${AI_REVIEW_DIR}/review-prompt.txt")"
 
-      - name: Approve PR when no unresolved bot review threads
-        if: >-
-          steps.generated-check.outputs.skip_review != 'true' &&
-          steps.opencode-review.outcome == 'success' &&
-          inputs.approve_when_clean == 'true'
+      # Deterministic post-steps run even if the review step failed midway —
+      # comments may already have been posted and still need cleanup.
+      - name: Resolve marked review threads
+        if: ${{ !cancelled() && steps.precompute.outputs.skip_review == 'false' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 "${AI_REVIEW_DIR}/bin/ai_review.py" resolve-threads
+
+      - name: Deduplicate summary comments
+        if: ${{ !cancelled() && steps.precompute.outputs.skip_review == 'false' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 "${AI_REVIEW_DIR}/bin/ai_review.py" dedupe-summaries
+
+      - name: Report timings
+        if: ${{ always() && steps.precompute.outputs.skip_review == 'false' }}
         run: |
-          set -euo pipefail
-          if [ -z "${APP_SLUG}" ]; then
-            echo "::error::APP_SLUG missing from app token step"
-            exit 1
-          fi
-          BOT_LOGIN="${APP_SLUG}[bot]"
-          GQL_THREADS='
-            query($owner: String!, $name: String!, $pr: Int!) {
-              repository(owner: $owner, name: $name) {
-                pullRequest(number: $pr) {
-                  reviewThreads(first: 100) {
-                    nodes {
-                      isResolved
-                      comments(first: 50) {
-                        nodes { author { login } }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          '
-          count_unresolved_bot_threads() {
-            gh api graphql -f query="${GQL_THREADS}" \
-              -f owner="${REPO_OWNER}" -f name="${REPO_NAME}" -F pr="${PR_NUMBER}" \
-              | jq --arg bot "${BOT_LOGIN}" '
-                  [.data.repository.pullRequest.reviewThreads.nodes[]
-                   | select(.isResolved == false)
-                   | select(any(.comments.nodes[]; .author.login == $bot))
-                  ] | length
-                '
-          }
-          # New threads from OpenCode/gh api may lag in GraphQL (eventual consistency); wait before checking.
-          echo "::group::Unresolved bot thread check"
-          echo "Waiting 30s for GitHub to index new review threads..."
-          sleep 30
-          UNRESOLVED="$(count_unresolved_bot_threads)"
-          echo "Unresolved bot threads: ${UNRESOLVED}"
-          echo "::endgroup::"
-          if [ "${UNRESOLVED}" -gt 0 ]; then
-            echo "::notice::Skipping approval: ${UNRESOLVED} unresolved review thread(s) involving ${BOT_LOGIN}"
-            exit 0
-          fi
-          echo "::notice::Submitting approving review for PR #${PR_NUMBER} (no unresolved bot inline threads)"
-          gh pr review "${PR_NUMBER}" --approve --body "AI review: no unresolved inline threads from ${BOT_LOGIN}."
+          echo "=== CLI call timings (UTC; calls made during the agent phase included) ==="
+          cat "${AI_REVIEW_DIR}/timing.log" 2>/dev/null || echo "(no timing log)"
+          echo ""
+          echo "=== Work-file completion times (UTC; when each phase produced its artifact) ==="
+          TZ=UTC ls -l --time-style=+%H:%M:%SZ "${AI_REVIEW_DIR}" 2>/dev/null || true
