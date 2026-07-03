@@ -218,6 +218,16 @@ jobs:
                       return Path(arg[1:]).read_text()
                   except OSError:
                       return arg  # literal body that happens to start with '@' (e.g. an @mention)
+              # Agents sometimes forget the '@' and pass a work-dir path bare; a
+              # path to an existing work file is never a legitimate comment body.
+              if re.fullmatch(r"[\w./-]+", arg):
+                  path = Path(arg)
+                  try:
+                      if path.is_file() and path.resolve().is_relative_to(WORK_DIR.resolve()):
+                          warn(f"Body argument {arg!r} is a work file — sending its contents (use @<path>)")
+                          return path.read_text()
+                  except OSError:
+                      pass
               return arg
 
 
@@ -657,13 +667,22 @@ jobs:
           SUBAGENT_MODEL: ${{ inputs.subagent_model }}
         run: |
           set -euo pipefail
+          # Defense in depth: the value lands in agent frontmatter via envsubst
+          # below. Callers are org-controlled, but validate anyway
+          # (same regex the repo-config sanitizer applies to `model`).
+          if ! [[ "${SUBAGENT_MODEL}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid subagent_model '${SUBAGENT_MODEL}'"
+            exit 1
+          fi
           mkdir -p .opencode/agents
 
-          cat > .opencode/agents/comment-categorizer.md << 'AGENT_EOF'
+          # Quoted heredocs keep the shell out; envsubst substitutes ONLY
+          # ${SUBAGENT_MODEL}, as literal data (never re-parsed as code).
+          cat << 'AGENT_EOF' | envsubst '${SUBAGENT_MODEL}' > .opencode/agents/comment-categorizer.md
           ---
           description: Categorizes existing bot review comments as ACTIVE, STALE, SUMMARY, or NO_ISSUES by comparing them against the PR diff. Use before the review to pre-compute comment state.
           mode: subagent
-          model: amazon-bedrock/__SUBAGENT_MODEL__
+          model: amazon-bedrock/${SUBAGENT_MODEL}
           tools:
             edit: false
           ---
@@ -699,11 +718,11 @@ jobs:
           If there are no existing comments, write all four arrays empty.
           AGENT_EOF
 
-          cat > .opencode/agents/comment-lifecycle.md << 'AGENT_EOF'
+          cat << 'AGENT_EOF' | envsubst '${SUBAGENT_MODEL}' > .opencode/agents/comment-lifecycle.md
           ---
           description: Manages the PR comment lifecycle — posts new review findings, replies to threads, marks stale threads resolved, and upserts the summary comment. Invoke after collecting review findings and comment categories.
           mode: subagent
-          model: amazon-bedrock/__SUBAGENT_MODEL__
+          model: amazon-bedrock/${SUBAGENT_MODEL}
           tools:
             edit: false
             write: false
@@ -735,9 +754,10 @@ jobs:
           - python3 .ai-review-work/bin/ai_review.py upsert-summary <body>
           - python3 .ai-review-work/bin/ai_review.py delete-comment <comment_id> [issue|review]
           A <body> argument can be literal text, @<path> to read from a file, or
-          "-" to read from stdin. For long or multi-line bodies, create a file
-          under .ai-review-work/ with a bash heredoc (the write tool is disabled
-          for you) and pass @<path>.
+          "-" to read from stdin. To send the contents of a file you MUST prefix
+          its path with @ — a bare path is posted as literal text. For long or
+          multi-line bodies, create a file under .ai-review-work/ with a bash
+          heredoc (the write tool is disabled for you) and pass @<path>.
           A nonzero exit means the operation failed (the CLI prints a warning
           with details).
 
@@ -790,7 +810,6 @@ jobs:
           - Do NOT re-fetch comments from the API — use only the pre-computed files.
           AGENT_EOF
 
-          perl -pi -e 's/__SUBAGENT_MODEL__/$ENV{SUBAGENT_MODEL}/g' .opencode/agents/*.md
           echo "Wrote OpenCode agent definitions:"
           ls -la .opencode/agents/
 
