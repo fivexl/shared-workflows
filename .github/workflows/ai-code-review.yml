@@ -45,7 +45,7 @@ on:
         type: string
         default: "us-east-1"
       model:
-        description: "Bedrock model ID for the orchestrator and review subagents (OpenCode amazon-bedrock provider)"
+        description: "Bedrock model ID or cross-region inference profile ID (e.g. us.anthropic.claude-opus-4-8) for the orchestrator and review subagents (OpenCode amazon-bedrock provider). ARN-style application inference profiles are not supported."
         required: false
         type: string
         default: "zai.glm-5"
@@ -268,7 +268,7 @@ jobs:
               # The config file comes from the PR branch: sanitize every value
               # that reaches prompts or CLI flags to prevent injection.
               raw_model = str(cfg.get("model") or model)
-              if re.fullmatch(r"[A-Za-z0-9._-]+", raw_model):
+              if re.fullmatch(r"[A-Za-z0-9._:-]+", raw_model):
                   model = raw_model
               else:
                   warn(f"Invalid model {raw_model!r}, using default {model!r}")
@@ -855,7 +855,7 @@ jobs:
           # Defense in depth: the value lands in agent frontmatter via envsubst
           # below. Callers are org-controlled, but validate anyway
           # (same regex the repo-config sanitizer applies to `model`).
-          if ! [[ "${SUBAGENT_MODEL}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          if ! [[ "${SUBAGENT_MODEL}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
             echo "::error::Invalid subagent_model '${SUBAGENT_MODEL}'"
             exit 1
           fi
