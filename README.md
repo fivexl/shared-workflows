@@ -208,7 +208,21 @@ How it works:
 - the workflow installs the `bmcp` CLI from a pinned, SHA256-verified GitHub
   release of `sirob-tech/boris-mcp-cli`;
 - `bmcp` authenticates to the BORIS endpoint with AWS SigV4 using the same
-  OIDC role the workflow already assumed — no additional secrets;
+  OIDC role the workflow already assumed — no additional secrets. The role
+  does need one extra permission: BORIS is fronted by an Amazon Bedrock
+  AgentCore gateway, so the CI role behind `BEDROCK_ROLE_ARN` must be allowed
+  to invoke it. Extend the `inline_policy_permissions` from the IAM example
+  above:
+
+  ```hcl
+      BorisGatewayInvoke = {
+        actions   = ["bedrock-agentcore:InvokeGateway"]
+        resources = ["arn:aws:bedrock-agentcore:<region>:<account-id>:gateway/<gateway-id>"]
+      }
+  ```
+
+  `<gateway-id>` and `<region>` are both in the BORIS MCP URL itself:
+  `https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp`;
 - `bmcp install opencode --scope project` writes BORIS usage instructions and
   the synced tool catalog into the runner's worktree (`BORIS.md` plus a managed
   block appended in `AGENTS.md` — the repo's own files are never overwritten),
@@ -217,6 +231,8 @@ How it works:
   infrastructure graph queries, memory search) and are told to use them when
   the dimension involves infrastructure;
 - BORIS being unreachable degrades gracefully — the review runs without it.
+  That includes a missing gateway permission: `bmcp` setup failures surface
+  as workflow warnings, not job failures.
 
 `boris_mcp_url` is intentionally a **workflow input, not repo config**: the
 org-controlled caller decides whether live infrastructure context is exposed,
