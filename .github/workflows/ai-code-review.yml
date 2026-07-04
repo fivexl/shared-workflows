@@ -45,7 +45,7 @@ on:
         type: string
         default: "us-east-1"
       model:
-        description: "Bedrock model or inference profile ID for the orchestrator and review subagents (OpenCode amazon-bedrock provider)"
+        description: "Bedrock model ID or cross-region inference profile ID (e.g. us.anthropic.claude-opus-4-8) for the orchestrator and review subagents (OpenCode amazon-bedrock provider). ARN-style application inference profiles are not supported."
         required: false
         type: string
         default: "zai.glm-5"
