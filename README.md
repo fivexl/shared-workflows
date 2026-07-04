@@ -87,7 +87,7 @@ Optional workflow inputs:
 | `subagent_model` | `nvidia.nemotron-super-3-120b` | Cheaper model for the mechanical comment-categorizer subagent |
 | `max_comments` | `10` | Inline comment cap per run; overflow lands in the summary |
 | `aws_region` | `us-east-1` | Bedrock region |
-| `boris_mcp_url` | _(empty)_ | Enable BORIS live-infrastructure context (see below) |
+| `boris_mcp_url` | _(empty)_ | Enable BORIS temporal infrastructure-graph context (see below) |
 | `show_full_output` | `false` | Verbose OpenCode logs in the job output |
 
 Repos can also tune the review without touching the caller via
@@ -188,12 +188,13 @@ console for the chosen region.
 
 ### BORIS live infrastructure context (optional)
 
-[BORIS](https://github.com/sirob-tech/boris-mcp-cli) is an MCP server that
-indexes AWS infrastructure: live resources, topology, code-to-infrastructure
-relationships, and prior operational decisions. Plugging it into the review
-gives the AI real deployment context instead of guesses — most valuable when
-reviewing infrastructure-as-code changes ("does this security group actually
-front anything?", "is this the only consumer of that queue?").
+[BORIS](https://www.getboris.ai/) maintains a temporal infrastructure graph
+linking live AWS resources, source code, and prior operational decisions —
+designed to span clouds and systems beyond AWS. Plugging it into the review
+(via the [bmcp CLI](https://github.com/sirob-tech/boris-mcp-cli)) gives the AI
+real deployment context instead of guesses — most valuable when reviewing
+infrastructure-as-code changes ("does this security group actually front
+anything?", "is this the only consumer of that queue?").
 
 Enable it by setting the input in the caller workflow:
 
@@ -237,4 +238,4 @@ never the PR branch.
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE). Copyright FivexL Consulting Services OÜ.
