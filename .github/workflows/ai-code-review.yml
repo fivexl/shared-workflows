@@ -65,7 +65,7 @@ on:
         type: string
         default: "false"
       boris_mcp_url:
-        description: "BORIS MCP URL. When set, the bmcp CLI is installed and review subagents may query live AWS/infra context (read-only). Org-controlled: set it in the caller workflow, never from repo config."
+        description: "BORIS MCP URL (https://www.getboris.ai/ — temporal infrastructure graph linking live AWS resources, source code, and prior operational decisions). When set, the bmcp CLI is installed and review subagents may query it (read-only). Org-controlled: set it in the caller workflow, never from repo config."
         required: false
         type: string
         default: ""
